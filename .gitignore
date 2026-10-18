@@ -1,0 +1,10 @@
+# runtime outputs and caches
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+generated/
+*.log
+.DS_Store
+.idea/
+.vscode/

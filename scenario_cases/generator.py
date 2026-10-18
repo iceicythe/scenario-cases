@@ -1,0 +1,118 @@
+"""由规格生成四路 CSV + 真值，格式与 case-analyzer 的输入约定一致。"""
+from __future__ import annotations
+
+import csv
+import io
+import json
+
+from scenario_cases.models import Scenario, ScenarioSpec, TruthEvent
+from scenario_cases.templates import braking_window, min_speed, resolve_params, speed_at
+
+GENERATOR_VERSION = "scenario-cases-0.1.0"
+GRID = 0.1  # 秒，车辆采样网格，与 case-analyzer 约定一致
+
+VEHICLE_HEADERS = ["timestamp", "speed_mps", "acceleration_mps2", "brake"]
+OBJECT_HEADERS = ["timestamp", "object_id", "distance_m", "relative_speed_mps", "confidence"]
+PLANNING_HEADERS = ["timestamp", "target_speed_mps", "planned_acceleration_mps2", "decision_reason"]
+CONTROL_HEADERS = ["timestamp", "brake_command", "throttle_command", "requested_acceleration_mps2"]
+
+
+def _table(headers, rows):
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream, lineterminator="\n")
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return stream.getvalue()
+
+
+def build_case(case_id: str, spec: ScenarioSpec, rows: int = 601) -> Scenario:
+    """生成一条场景。rows 为采样点数（默认 601 ≈ 60 秒）。"""
+    if rows < 10:
+        raise ValueError("采样点至少 10 个（case-analyzer 要求车辆至少 6 点，留足余量）")
+    params = resolve_params(spec.profile, spec.params)
+    if min_speed(spec.profile, params) < 1.0:
+        raise ValueError(f"规格会生成接近停止的车速：{spec.profile} {params}")
+
+    vehicle, objects, planning, control = [], [], [], []
+    distance = 60.0
+    window = braking_window(spec.profile, params)
+    for i in range(rows):
+        t = i * GRID
+        speed, acceleration = speed_at(spec.profile, t, params)
+        braking = acceleration < 0
+        brake = 0.6 if braking else 0.0
+        vehicle.append([f"{t:.1f}", f"{speed:.3f}", f"{acceleration:.3f}", brake])
+
+        relative = 16.0 - speed
+        if spec.profile == "lead_cut_in" and braking:
+            relative -= 4.0  # 切入目标额外接近，制造目标证据变化
+        if i:
+            distance += relative * GRID
+        objects.append([f"{t:.1f}", "target_a", f"{distance:.3f}", f"{relative:.3f}", 0.95])
+
+        reason = "CRUISE"
+        if braking:
+            reason = "EMERGENCY_BRAKE" if spec.profile == "lead_cut_in" else "FOLLOW_LEAD_VEHICLE"
+        planning.append([f"{t:.1f}", f"{max(0.0, speed + acceleration * GRID):.3f}",
+                         acceleration, reason])
+        control.append([f"{t:.1f}", brake, 0.15 if not braking else 0.0, acceleration])
+
+    events = []
+    if window:
+        events.append(TruthEvent(window[0], window[1]))
+    notes = []
+    if window:
+        drop = params.get("decel", 0.0) * 0.5
+        if drop < 1.3:
+            notes.append("贴边界样本：0.5 秒降幅 %.2f m/s，刚过 SD-WINDOW-1.1 门槛" % drop)
+
+    files = {
+        "vehicle_state.csv": _table(VEHICLE_HEADERS, vehicle),
+        "object_state.csv": _table(OBJECT_HEADERS, objects),
+        "planning_state.csv": _table(PLANNING_HEADERS, planning),
+        "control_state.csv": _table(CONTROL_HEADERS, control),
+    }
+    return Scenario(case_id=case_id, spec=spec, files=files, events=events, notes=notes)
+
+
+def source_json(scenario: Scenario) -> str:
+    """来源声明：合成数据，运动学级，不是道路采集或闭环仿真。"""
+    payload = {
+        "case_id": scenario.case_id,
+        "source_type": "synthetic",
+        "source_name": "公式生成的仿真场景；运动学级时间序列，不是道路采集或闭环仿真",
+        "acceleration_source": "由车速有限差分得到，不是独立传感器测量",
+        "generator": GENERATOR_VERSION,
+        "spec": {"profile": scenario.spec.profile, "params": scenario.spec.params},
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def truth_json(scenario: Scenario) -> str:
+    """真值：注入的事件窗口 + 设计备注，供闭环回归对答案用。"""
+    payload = {
+        "generator": GENERATOR_VERSION,
+        "case_id": scenario.case_id,
+        "sampling_grid_s": GRID,
+        "spec": {"profile": scenario.spec.profile, "params": scenario.spec.params},
+        "events": [event.as_dict() for event in scenario.events],
+        "notes": scenario.notes,
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+
+
+def write_case(scenario: Scenario, directory) -> list:
+    """把一条场景落盘：四路 CSV + source.json + truth.json，返回写出的文件名。"""
+    from pathlib import Path
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    written = []
+    for name, text in scenario.files.items():
+        path = directory / name
+        path.write_text(text, encoding="utf-8", newline="\n")
+        written.append(name)
+    (directory / "source.json").write_text(source_json(scenario), encoding="utf-8", newline="\n")
+    (directory / "truth.json").write_text(truth_json(scenario), encoding="utf-8", newline="\n")
+    written += ["source.json", "truth.json"]
+    return written
