@@ -107,6 +107,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     stats = lib_sub.add_parser("stats", help="库整体统计")
     stats.add_argument("--db", type=Path, default=DEFAULT_DB)
+
+    regress = sub.add_parser("regress", help="闭环回归：生成 → case-analyzer 全跑 → 对真值 → 检出率/误报率")
+    regress.add_argument("--count", type=int, default=20, help="场景条数，默认 20")
+    regress.add_argument("--seed", type=int, default=20261019, help="随机种子，可复现")
+    regress.add_argument("--rows", type=int, default=601, help="每条采样点数，默认 601")
+    regress.add_argument("--out", type=Path, default=None,
+                         help="工作目录（场景、runtime、报告）；默认临时目录，跑完即清")
+    regress.add_argument("--keep", action="store_true", help="保留默认临时目录中的现场")
+    regress.add_argument("--analyzer", type=Path, default=None,
+                         help="case-analyzer 源码目录；默认读 CASE_ANALYZER_ROOT 或同级目录")
+    regress.add_argument("--coverage-rule", type=float, default=0.9,
+                         help="真值事件被判检出的候选覆盖阈值，默认 0.9")
     return parser
 
 
@@ -116,7 +128,24 @@ def main(argv=None) -> int:
         return _run_generate(args)
     if args.command == "library":
         return _run_library(args)
+    if args.command == "regress":
+        return _run_regress(args)
     return 2
+
+
+def _run_regress(args) -> int:
+    # 延迟导入：regress 依赖 case-analyzer 环境，generate/library 不依赖
+    from scenario_cases.regress import format_report, run_regression
+
+    try:
+        report = run_regression(count=args.count, seed=args.seed, rows=args.rows,
+                                out=args.out, analyzer=args.analyzer, keep=args.keep,
+                                coverage_rule=args.coverage_rule)
+    except ValueError as error:
+        print(f"回归未开始：{error}", file=sys.stderr)
+        return 2
+    print(format_report(report))
+    return 0
 
 
 def _run_generate(args) -> int:
