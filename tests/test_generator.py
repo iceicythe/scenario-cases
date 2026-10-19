@@ -70,6 +70,18 @@ class GeneratorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_case("scn_006", ScenarioSpec("hard_brake", {"v0": 12.0, "decel": 4.0, "duration": 4.0}), rows=100)
 
+    def test_object_distance_stays_positive_and_consistent(self):
+        # 目标间距永不为负；relative_speed 列与 distance 列的差分严格自洽。
+        for profile in ("cruise", "mild_decel", "hard_brake", "lead_cut_in"):
+            case = build_case(f"scn_obj_{profile}", ScenarioSpec(profile), rows=601)
+            table = rows_of(case.files["object_state.csv"])[1:]
+            distances = [float(row[2]) for row in table]
+            relatives = [float(row[3]) for row in table]
+            self.assertGreaterEqual(min(distances), 5.0, profile)
+            for index in range(1, len(distances)):
+                expected = (distances[index] - distances[index - 1]) / 0.1
+                self.assertAlmostEqual(relatives[index], expected, delta=0.02, msg=profile)
+
     def test_write_case_outputs_six_files(self):
         case = build_case("scn_007", ScenarioSpec("lead_cut_in"), rows=30)
         with tempfile.TemporaryDirectory() as temporary:

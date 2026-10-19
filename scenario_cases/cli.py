@@ -1,7 +1,8 @@
-"""批量生成命令行：python -m scenario_cases generate ..."""
+"""命令行入口：python -m scenario_cases <generate|library> ..."""
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import sys
@@ -9,10 +10,13 @@ from pathlib import Path
 
 from scenario_cases.generator import GENERATOR_VERSION, build_case, write_case
 from scenario_cases.models import ScenarioSpec
+from scenario_cases.store import TRUTH_FILE, ScenarioLibrary
 from scenario_cases.templates import DEFAULTS, PROFILE_NAMES, RANGES
 
 # 批量时的模板配比：多数有事件，少量无事件（负样本）， cut_in 少量
 MIX = {"hard_brake": 0.35, "mild_decel": 0.3, "lead_cut_in": 0.2, "cruise": 0.15}
+
+DEFAULT_DB = Path("scenario_library.db")
 
 
 def pick_profile(rng: random.Random) -> str:
@@ -58,23 +62,64 @@ def generate_batch(out: Path, count: int, rows: int, seed: int) -> list:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m scenario_cases",
-                                     description="批量生成运动学级仿真场景（四路 CSV + 真值）")
+    parser = argparse.ArgumentParser(
+        prog="python -m scenario_cases",
+        description="运动学级仿真场景：生成带真值的测试数据，并入库管理")
     sub = parser.add_subparsers(dest="command", required=True)
-    gen = sub.add_parser("generate", help="生成一批场景")
+
+    gen = sub.add_parser("generate", help="生成一批场景（四路 CSV + 真值）")
     gen.add_argument("--out", type=Path, required=True, help="输出目录（每个场景一个子目录）")
     gen.add_argument("--count", type=int, default=20, help="场景条数，默认 20")
     gen.add_argument("--rows", type=int, default=601, help="每条场景采样点数，默认 601（约 60 秒）")
     gen.add_argument("--seed", type=int, default=20261018, help="随机种子，相同种子结果可复现")
     gen.add_argument("--profiles", default=",".join(PROFILE_NAMES),
                      help="参与混合的模板，逗号分隔；默认全部")
+
+    lib = sub.add_parser("library", help="场景库：入库、检索、导出")
+    lib_sub = lib.add_subparsers(dest="library_command", required=True)
+
+    add = lib_sub.add_parser("add", help="把场景目录登记入库（内容指纹去重）")
+    add.add_argument("directories", nargs="+", type=Path,
+                     help="场景目录（含四路 CSV、truth.json 与 source.json）")
+    add.add_argument("--db", type=Path, default=DEFAULT_DB,
+                     help="库文件路径，默认 scenario_library.db")
+
+    listing = lib_sub.add_parser("list", help="按条件检索场景")
+    listing.add_argument("--db", type=Path, default=DEFAULT_DB)
+    listing.add_argument("--profile", help="按车速曲线模板筛选，如 hard_brake")
+    listing.add_argument("--event", help="按真值事件类型筛选，如 deceleration")
+    listing.add_argument("--min-decel", type=float, help="减速度下限（m/s²）")
+    listing.add_argument("--max-decel", type=float, help="减速度上限（m/s²）")
+    listing.add_argument("--min-v0", type=float, help="初速度下限（m/s）")
+    listing.add_argument("--max-v0", type=float, help="初速度上限（m/s）")
+    listing.add_argument("--with-events", choices=["yes", "no"],
+                         help="只要 有/没有 真值事件的场景")
+    listing.add_argument("--json", action="store_true", help="以 JSON 输出，便于脚本消费")
+
+    show = lib_sub.add_parser("show", help="查看单条场景的详情与真值")
+    show.add_argument("scenario_id")
+    show.add_argument("--db", type=Path, default=DEFAULT_DB)
+
+    export = lib_sub.add_parser("export", help="把库中场景原样导出到目录")
+    export.add_argument("scenario_id")
+    export.add_argument("out", type=Path, help="输出目录")
+    export.add_argument("--db", type=Path, default=DEFAULT_DB)
+
+    stats = lib_sub.add_parser("stats", help="库整体统计")
+    stats.add_argument("--db", type=Path, default=DEFAULT_DB)
     return parser
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    if args.command != "generate":
-        return 2
+    if args.command == "generate":
+        return _run_generate(args)
+    if args.command == "library":
+        return _run_library(args)
+    return 2
+
+
+def _run_generate(args) -> int:
     if args.count < 1 or args.rows < 10:
         print("count 至少 1，rows 至少 10", file=sys.stderr)
         return 2
@@ -94,6 +139,81 @@ def main(argv=None) -> int:
     print("模板混合：" + "，".join(f"{name} {MIX[name]:.0%}" for name in allowed))
     print("数据为公式合成的运动学级序列，不是道路采集或闭环仿真。")
     return 0
+
+
+def _format_record(record) -> str:
+    params = " ".join(f"{key}={value}" for key, value in sorted(record.params.items()))
+    events = f"{record.event_count} 个事件" if record.event_count else "无事件（负样本）"
+    return f"{record.scenario_id}  {record.profile}  {params}  {record.rows} 行  {events}"
+
+
+def _expand_targets(paths) -> list:
+    """add 的参数既可以是单个场景目录，也可以是批量目录（自动展开其中的场景子目录）。"""
+    targets = []
+    for path in paths:
+        path = Path(path)
+        if not path.is_dir() or (path / TRUTH_FILE).is_file():
+            targets.append(path)
+            continue
+        children = sorted(child for child in path.iterdir()
+                          if child.is_dir() and (child / TRUTH_FILE).is_file())
+        targets.extend(children or [path])
+    return targets
+
+
+def _run_library(args) -> int:
+    library = ScenarioLibrary(args.db)
+    if args.library_command == "add":
+        summary = library.add_many(_expand_targets(args.directories))
+        for result in summary["added"]:
+            print(f"入库 {result.scenario_id}（{result.detail}）")
+        for result in summary["duplicate"]:
+            print(f"跳过 {result.scenario_id}（{result.detail}）")
+        for directory, message in summary["failed"]:
+            print(f"失败 {directory}：{message}", file=sys.stderr)
+        print(f"合计：新增 {len(summary['added'])}，重复 {len(summary['duplicate'])}，"
+              f"失败 {len(summary['failed'])}")
+        return 1 if summary["failed"] else 0
+
+    if args.library_command == "list":
+        with_events = {"yes": True, "no": False}.get(args.with_events)
+        records = library.query(profile=args.profile, event_kind=args.event,
+                                min_decel=args.min_decel, max_decel=args.max_decel,
+                                min_v0=args.min_v0, max_v0=args.max_v0,
+                                with_events=with_events)
+        if args.json:
+            print(json.dumps([record.as_dict() for record in records],
+                             ensure_ascii=False, indent=2))
+        else:
+            for record in records:
+                print(_format_record(record))
+            print(f"共 {len(records)} 条")
+        return 0
+
+    if args.library_command == "show":
+        record = library.get(args.scenario_id)
+        if record is None:
+            print(f"库中没有 {args.scenario_id}", file=sys.stderr)
+            return 1
+        print(json.dumps(record.as_dict(), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.library_command == "export":
+        written = library.export(args.scenario_id, args.out)
+        if not written:
+            print(f"库中没有 {args.scenario_id}", file=sys.stderr)
+            return 1
+        print(f"已导出 {args.scenario_id} → {args.out}（{len(written)} 个文件，字节级一致）")
+        return 0
+
+    if args.library_command == "stats":
+        summary = library.stats()
+        print(f"共 {summary['total']} 条 · 有事件 {summary['with_events']} · "
+              f"无事件 {summary['without_events']} · 合计 {summary['rows_total']} 行")
+        for profile, count in summary["by_profile"].items():
+            print(f"  {profile}: {count}")
+        return 0
+    return 2
 
 
 if __name__ == "__main__":

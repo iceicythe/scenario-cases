@@ -4,6 +4,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+from dataclasses import replace
 
 from scenario_cases.models import Scenario, ScenarioSpec, TruthEvent
 from scenario_cases.templates import braking_window, min_speed, resolve_params, speed_at
@@ -25,6 +26,16 @@ def _table(headers, rows):
     return stream.getvalue()
 
 
+def follow_relative(distance: float, speed: float) -> float:
+    """简易跟车模型：相对速度与间距误差成正比，间距收敛到目标车距。
+
+    目标车距随车速变化（快车距大），因此减速时间距自然缩短、目标表现"接近"，
+    与减速事件的证据方向一致；间距永远为正，不会穿模。
+    """
+    desired = max(10.0, speed)
+    return max(-12.0, min(6.0, (desired - distance) * 0.2))
+
+
 def build_case(case_id: str, spec: ScenarioSpec, rows: int = 601) -> Scenario:
     """生成一条场景。rows 为采样点数（默认 601 ≈ 60 秒）。"""
     if rows < 10:
@@ -32,6 +43,8 @@ def build_case(case_id: str, spec: ScenarioSpec, rows: int = 601) -> Scenario:
     params = resolve_params(spec.profile, spec.params)
     if min_speed(spec.profile, params) < 1.0:
         raise ValueError(f"规格会生成接近停止的车速：{spec.profile} {params}")
+    # 真值记录补齐后的完整参数：默认值填上的才是真正生成数据的参数
+    spec = replace(spec, params=params)
 
     vehicle, objects, planning, control = [], [], [], []
     distance = 60.0
@@ -43,11 +56,15 @@ def build_case(case_id: str, spec: ScenarioSpec, rows: int = 601) -> Scenario:
         brake = 0.6 if braking else 0.0
         vehicle.append([f"{t:.1f}", f"{speed:.3f}", f"{acceleration:.3f}", brake])
 
-        relative = 16.0 - speed
+        relative = follow_relative(distance, speed)
         if spec.profile == "lead_cut_in" and braking:
-            relative -= 4.0  # 切入目标额外接近，制造目标证据变化
+            relative = max(relative - 4.0, -14.0)  # 切入目标额外接近
         if i:
-            distance += relative * GRID
+            step = relative * GRID
+            if distance + step < 5.0:  # 触底保护：本步不再接近，保持相对速度列与距离列自洽
+                step = 5.0 - distance
+                relative = step / GRID
+            distance += step
         objects.append([f"{t:.1f}", "target_a", f"{distance:.3f}", f"{relative:.3f}", 0.95])
 
         reason = "CRUISE"

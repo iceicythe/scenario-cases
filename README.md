@@ -35,6 +35,35 @@ generated/batch_001/
 
 相同 `--seed` 结果完全可复现；`--profiles hard_brake,cruise` 可指定参与混合的模板。
 
+## 场景库（SQLite 单文件）
+
+生成的一批场景可以登记进一个单文件 SQLite 库：元数据、真值事件与文件内容一起入库，
+按内容指纹去重（内容相同即重复，与目录位置无关），支持按模板、事件类型、参数范围检索，
+也能原样导出（字节级一致）。没有来源声明（`source.json`）的场景不予入库。
+
+```shell
+# 入库：参数可以是批量目录（自动展开其中的场景子目录），也可以是单个场景目录
+python -m scenario_cases library add ./generated/batch_001 --db ./library.db
+
+# 检索：所有含急刹的场景
+python -m scenario_cases library list --profile hard_brake --db ./library.db
+
+# 检索：减速度 ≥ 4 m/s² 的场景，JSON 输出便于脚本消费
+python -m scenario_cases library list --min-decel 4.0 --json --db ./library.db
+
+# 只要没有真值事件的负样本
+python -m scenario_cases library list --with-events no --db ./library.db
+
+# 导出、详情、统计
+python -m scenario_cases library export scn_000 ./out/scn_000 --db ./library.db
+python -m scenario_cases library show scn_000 --db ./library.db
+python -m scenario_cases library stats --db ./library.db
+```
+
+设计取舍：单文件 SQLite = 零依赖、一个文件拷走就是整个库（不上 Postgres/MySQL 的理由：
+单机单人工具、要能一键拷走）；文件内容随元数据入库 = 源目录删了也能原样导出；
+常用检索轴（profile / v0 / decel / duration / at）建成列，完整参数另存 JSON，范围查询走列、信息不丢。
+
 ## 场景模板
 
 | 模板 | 行为 | 真值事件 |
@@ -55,12 +84,12 @@ python -B -m unittest discover -s tests -v
 ```
 
 覆盖模板数学性质（门槛/范围/单调性）、生成器输出（表头、网格、真值一致性、来源声明）、
-命令行（批量、可复现、参数校验）。
+命令行（批量、可复现、参数校验）、场景库（去重、检索、导出、持久化、CLI 往返）。
 
 ## 路线图（按周推进，范围只缩不扩）
 
 - [x] W1–W2：场景模板与生成器（四路 CSV + 真值 + 来源声明 + 测试）
-- [ ] W3：场景库入库（SQLite、sha256 指纹去重、按参数检索）
+- [x] W3：场景库入库（SQLite 单文件、sha256 指纹去重、按参数检索、原样导出）
 - [ ] W4：闭环回归（生成 → 调用 case-analyzer 全跑 → 对真值 → 检出率/误报率报告）
 - [ ] W4+：回归集导出、checklist 沉淀（视进度取舍）
 
