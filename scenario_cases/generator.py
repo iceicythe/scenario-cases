@@ -1,4 +1,9 @@
-"""由规格生成四路 CSV + 真值，格式与 case-analyzer 的输入约定一致。"""
+"""由规格生成四路 CSV + 真值，格式与 case-analyzer 的输入约定一致。
+
+真值怎么定：不记录"注入了什么制动窗"——那是和被评测工具共享假设的循环论证。
+真值由 protocol.py 的参考实现从生成出来的车辆数据按 SD-WINDOW-1.1 算出，
+两个独立实现一致才算检出。设计意图（注入了什么）另存于 spec 与 notes。
+"""
 from __future__ import annotations
 
 import csv
@@ -7,10 +12,10 @@ import json
 from dataclasses import replace
 
 from scenario_cases.models import Scenario, ScenarioSpec, TruthEvent
-from scenario_cases.templates import braking_window, min_speed, resolve_params, speed_at
+from scenario_cases.protocol import PROTOCOL_ID, reference_events
+from scenario_cases.templates import GRID, design_notes, min_speed, resolve_params, speed_at
 
-GENERATOR_VERSION = "scenario-cases-0.1.0"
-GRID = 0.1  # 秒，车辆采样网格，与 case-analyzer 约定一致
+GENERATOR_VERSION = "scenario-cases-0.2.0"
 
 VEHICLE_HEADERS = ["timestamp", "speed_mps", "acceleration_mps2", "brake"]
 OBJECT_HEADERS = ["timestamp", "object_id", "distance_m", "relative_speed_mps", "confidence"]
@@ -48,7 +53,6 @@ def build_case(case_id: str, spec: ScenarioSpec, rows: int = 601) -> Scenario:
 
     vehicle, objects, planning, control = [], [], [], []
     distance = 60.0
-    window = braking_window(spec.profile, params)
     for i in range(rows):
         t = i * GRID
         speed, acceleration = speed_at(spec.profile, t, params)
@@ -74,21 +78,20 @@ def build_case(case_id: str, spec: ScenarioSpec, rows: int = 601) -> Scenario:
                          acceleration, reason])
         control.append([f"{t:.1f}", brake, 0.15 if not braking else 0.0, acceleration])
 
-    events = []
-    if window:
-        events.append(TruthEvent(window[0], window[1]))
-    notes = []
-    if window:
-        drop = params.get("decel", 0.0) * 0.5
-        if drop < 1.3:
-            notes.append("贴边界样本：0.5 秒降幅 %.2f m/s，刚过 SD-WINDOW-1.1 门槛" % drop)
-
     files = {
         "vehicle_state.csv": _table(VEHICLE_HEADERS, vehicle),
         "object_state.csv": _table(OBJECT_HEADERS, objects),
         "planning_state.csv": _table(PLANNING_HEADERS, planning),
         "control_state.csv": _table(CONTROL_HEADERS, control),
     }
+
+    # 真值：按 SD-WINDOW-1.1 参考实现从刚生成的车辆数据计算。
+    # V 形样本的设计制动窗是 [at, at+dip]，而口径事件是 [at-0.1, at+dip]——
+    # 窗口向左多探一个采样。记录注入参数就等于把工具的假设当真值，会循环论证。
+    events = [TruthEvent(item["start"], item["end"], item["kind"])
+              for item in reference_events(files["vehicle_state.csv"])]
+    notes = design_notes(spec.profile, params)
+
     return Scenario(case_id=case_id, spec=spec, files=files, events=events, notes=notes)
 
 
@@ -106,11 +109,13 @@ def source_json(scenario: Scenario) -> str:
 
 
 def truth_json(scenario: Scenario) -> str:
-    """真值：注入的事件窗口 + 设计备注，供闭环回归对答案用。"""
+    """真值：参考实现算出的事件窗口 + 设计备注，供闭环回归对答案用。"""
     payload = {
         "generator": GENERATOR_VERSION,
         "case_id": scenario.case_id,
         "sampling_grid_s": GRID,
+        "truth_basis": (f"{PROTOCOL_ID} 参考实现（scenario_cases/protocol.py）"
+                        f"从生成的车辆数据计算，非注入参数"),
         "spec": {"profile": scenario.spec.profile, "params": scenario.spec.params},
         "events": [event.as_dict() for event in scenario.events],
         "notes": scenario.notes,

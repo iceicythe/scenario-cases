@@ -44,8 +44,10 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(record.profile, "hard_brake")
         self.assertEqual(record.rows, 60)
         self.assertEqual(record.event_count, 1)
+        # 真值由参考实现算出：左探窗口 [4.9,5.4] 合格，事件从 4.9 开始；
+        # 数据只到 5.9 秒，制动窗 [5.0,8.0] 被末尾截断，事件到 5.9 结束
         self.assertEqual([(kind, start, end) for kind, start, end in record.events],
-                         [("deceleration", 5.0, 8.0)])
+                         [("deceleration", 4.9, 5.9)])
         self.assertEqual(record.params["decel"], 4.0)
 
     def test_same_directory_twice_is_duplicate(self):

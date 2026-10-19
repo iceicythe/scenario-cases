@@ -11,49 +11,63 @@ from pathlib import Path
 from scenario_cases.generator import GENERATOR_VERSION, build_case, write_case
 from scenario_cases.models import ScenarioSpec
 from scenario_cases.store import TRUTH_FILE, ScenarioLibrary
-from scenario_cases.templates import DEFAULTS, PROFILE_NAMES, RANGES
+from scenario_cases.templates import (DEFAULTS, PROFILE_NAMES, param_range)
 
-# 批量时的模板配比：多数有事件，少量无事件（负样本）， cut_in 少量
-MIX = {"hard_brake": 0.35, "mild_decel": 0.3, "lead_cut_in": 0.2, "cruise": 0.15}
+# 批量时的模板配比：典型组占六成，对抗组占三成，负样本一成。
+# 对抗组专门打口径边界——如果闭环还是 100% 检出 0 误报，说明样本造得太乖。
+MIX = {"hard_brake": 0.24, "mild_decel": 0.20, "lead_cut_in": 0.16, "cruise": 0.10,
+       "sub_threshold": 0.10, "short_dip": 0.08, "v_dip": 0.06, "jitter": 0.04,
+       "double_dip": 0.02}
 
 DEFAULT_DB = Path("scenario_library.db")
 
+# 时间类参数抖动后对齐 0.1 秒采样网格：不对齐会让制动窗落在半个间隔上，
+# 边界样本的"应有结论"变得没法手算复核。
+GRID_KEYS = ("duration", "at", "dip", "recover", "gap")
 
-def pick_profile(rng: random.Random) -> str:
+
+def _snap(value: float) -> float:
+    return round(value * 10) / 10
+
+
+def pick_profile(rng: random.Random, mix: dict | None = None) -> str:
+    weights = MIX if mix is None else mix
     roll = rng.random()
     cumulative = 0.0
-    for name, weight in MIX.items():
+    for name, weight in weights.items():
         cumulative += weight
         if roll <= cumulative:
             return name
-    return "cruise"
+    return list(weights)[-1]  # 权重和为 1 时不会走到；兜底返回最后一个
 
 
 def jitter(rng: random.Random, profile: str) -> dict:
-    """在模板范围内抖动参数；未知参数键不动。"""
+    """在模板范围内抖动参数；没有范围的参数保持默认值不动。"""
     params = {}
     for key, value in DEFAULTS[profile].items():
-        if key not in RANGES:
+        bounds = param_range(profile, key)
+        if bounds is None:
             params[key] = value
             continue
-        low, high = RANGES[key]
-        if key == "decel":
-            # 减速度下限保留门槛余量，抖动时同样遵守
-            low = max(low, 2.2)
-        params[key] = round(rng.uniform(low, high), 2)
-    if profile != "cruise":
-        # 联合约束：单个参数合法不代表组合合法——末端车速至少保留 3 m/s 余量。
-        # 时长向下取整到 0.01 秒，取整只会更保守，不会把余量吃掉。
-        max_duration = math.floor((params["v0"] - 3.0) / params["decel"] * 100) / 100
-        params["duration"] = round(min(params["duration"], max(0.8, max_duration)), 2)
+        low, high = bounds
+        drawn = round(rng.uniform(low, high), 2)
+        params[key] = _snap(drawn) if key in GRID_KEYS else drawn
+    # 联合约束：单个参数合法不代表组合合法——末端车速至少保留 3 m/s 余量。
+    # 只对减速度与时长都参与抖动的模板生效（典型组与 sub_threshold）；
+    # double_dip 时长范围很窄、约束恒成立，jitter/v_dip 等没有这两个键。
+    # 上限同样向下取到 0.1 秒网格：取整只会更保守，不会把末端余量吃掉，
+    # 也不会把对齐网格的时长又抖成半个间隔。
+    if "decel" in params and "duration" in params:
+        max_duration = math.floor((params["v0"] - 3.0) / params["decel"] * 10) / 10
+        params["duration"] = min(params["duration"], max(0.8, max_duration))
     return params
 
 
-def generate_batch(out: Path, count: int, rows: int, seed: int) -> list:
+def generate_batch(out: Path, count: int, rows: int, seed: int, mix: dict | None = None) -> list:
     rng = random.Random(seed)
     written = []
     for index in range(count):
-        profile = pick_profile(rng)
+        profile = pick_profile(rng, mix)
         params = jitter(rng, profile)
         spec = ScenarioSpec(profile=profile, params=params)
         scenario = build_case(f"scn_{index:03d}", spec, rows)
@@ -157,15 +171,16 @@ def _run_generate(args) -> int:
         print(f"未知模板：{', '.join(unknown)}；可用：{', '.join(PROFILE_NAMES)}", file=sys.stderr)
         return 2
     allowed = [name for name in args.profiles.split(",") if name]
+    # 子集配比在局部归一化，不碰全局 MIX——原地改全局会让同进程内
+    # 后续批次混进上一次的模板（roll 的上界变成权重和，直接错位）。
     weights = {name: MIX.get(name, 0.0) for name in allowed}
     total = sum(weights.values()) or 1.0
-    for name in allowed:
-        MIX[name] = weights[name] / total
+    mix = {name: weight / total for name, weight in weights.items()}
 
-    files = generate_batch(args.out, args.count, args.rows, args.seed)
+    files = generate_batch(args.out, args.count, args.rows, args.seed, mix)
     print(f"已生成 {args.count} 条场景 → {args.out}（{len(files)} 个文件，种子 {args.seed}，"
           f"生成器 {GENERATOR_VERSION}）")
-    print("模板混合：" + "，".join(f"{name} {MIX[name]:.0%}" for name in allowed))
+    print("模板混合：" + "，".join(f"{name} {mix[name]:.0%}" for name in allowed))
     print("数据为公式合成的运动学级序列，不是道路采集或闭环仿真。")
     return 0
 
