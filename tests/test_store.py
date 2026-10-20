@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -206,8 +207,11 @@ class StoreTests(unittest.TestCase):
 
 
 def run_cli(*args):
+    # 显式传 PYTHONUTF8=1：-X utf8 不遗传给子进程，Windows 默认 cp936 会让
+    # 中文输出按 GBK 打印、父进程按 utf-8 解码报错（详见 test_cli.py 同款注释）。
+    env = {**os.environ, "PYTHONUTF8": "1"}
     return subprocess.run([sys.executable, "-B", "-m", "scenario_cases", *args],
-                          cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+                          cwd=ROOT, capture_output=True, text=True, encoding="utf-8", env=env)
 
 
 class CliLibraryTests(unittest.TestCase):

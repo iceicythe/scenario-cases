@@ -1,10 +1,12 @@
-"""命令行入口：python -m scenario_cases <generate|library> ..."""
+"""命令行入口：python -m scenario_cases <generate|library|suite|regress> ..."""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import random
+import re
 import sys
 from pathlib import Path
 
@@ -25,9 +27,29 @@ DEFAULT_DB = Path("scenario_library.db")
 # 边界样本的"应有结论"变得没法手算复核。
 GRID_KEYS = ("duration", "at", "dip", "recover", "gap")
 
+# 人工指定批次名时的合法字符：会进目录名和数据库 ID，窄一点不惹事
+TAG_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,24}")
+
 
 def _snap(value: float) -> float:
     return round(value * 10) / 10
+
+
+def batch_tag(seed: int, rows: int, mix: dict | None = None, tag: str | None = None) -> str:
+    """批次命名空间：显式 tag 优先，否则由配置算短哈希。
+
+    为什么需要它：每批都从 scn_000 编号时，第二批入库会和第一批撞 ID
+    （同 ID 不同内容 → 入库失败），场景库没法跨批次持续积累。
+    同一种子 + 行数 + 模板配比 → 同一标签（可复现，重复入库靠内容指纹去重）；
+    任何一项不同 → 不同标签（两批互不撞 ID，可同时入库）。
+    刻意不含 count：条数不改变单条场景的内容，多生成几条应与少生成几条
+    共用命名空间，让指纹去重去识别重复，而不是换一批新 ID。
+    """
+    if tag:
+        return tag
+    mix_key = json.dumps(sorted((mix or MIX).items()), ensure_ascii=False)
+    digest = hashlib.sha1(f"{GENERATOR_VERSION}|{seed}|{rows}|{mix_key}".encode("utf-8"))
+    return digest.hexdigest()[:6]
 
 
 def pick_profile(rng: random.Random, mix: dict | None = None) -> str:
@@ -63,14 +85,16 @@ def jitter(rng: random.Random, profile: str) -> dict:
     return params
 
 
-def generate_batch(out: Path, count: int, rows: int, seed: int, mix: dict | None = None) -> list:
+def generate_batch(out: Path, count: int, rows: int, seed: int, mix: dict | None = None,
+                   tag: str | None = None) -> list:
+    namespace = batch_tag(seed, rows, mix, tag)
     rng = random.Random(seed)
     written = []
     for index in range(count):
         profile = pick_profile(rng, mix)
         params = jitter(rng, profile)
         spec = ScenarioSpec(profile=profile, params=params)
-        scenario = build_case(f"scn_{index:03d}", spec, rows)
+        scenario = build_case(f"scn_{namespace}_{index:03d}", spec, rows)
         written.extend(write_case(scenario, out / scenario.case_id))
     return written
 
@@ -88,6 +112,9 @@ def build_parser() -> argparse.ArgumentParser:
     gen.add_argument("--seed", type=int, default=20261018, help="随机种子，相同种子结果可复现")
     gen.add_argument("--profiles", default=",".join(PROFILE_NAMES),
                      help="参与混合的模板，逗号分隔；默认全部")
+    gen.add_argument("--tag", default=None,
+                     help="批次命名空间（字母/数字/-/_，1-24 字符）；默认由配置自动生成短哈希。"
+                          "场景 ID 为 scn_<tag>_序号，不同批次不会撞 ID")
 
     lib = sub.add_parser("library", help="场景库：入库、检索、导出")
     lib_sub = lib.add_subparsers(dest="library_command", required=True)
@@ -162,6 +189,22 @@ def build_parser() -> argparse.ArgumentParser:
                          help="case-analyzer 源码目录；默认读 CASE_ANALYZER_ROOT 或同级目录")
     regress.add_argument("--coverage-rule", type=float, default=0.9,
                          help="真值事件被判检出的候选覆盖阈值，默认 0.9")
+    regress.add_argument("--check", action="store_true",
+                         help="门禁模式：导入失败/口径误判/实现不一致/漏检/噪声占比/结构不一致"
+                              "任一未过即返回非零退出码（供 CI 或本地发布前拦截）")
+    regress.add_argument("--max-noise-candidates", type=float, default=0.25,
+                         help="--check 的误报候选占比容忍上限，默认 0.25"
+                              "（宽筛固有噪声，不要求零）")
+    regress.add_argument("--max-missed", type=int, default=0,
+                         help="--check 允许的漏检真值事件数，默认 0")
+    regress.add_argument("--max-misjudged", type=int, default=0,
+                         help="--check 允许的口径误判候选数，默认 0（这是实现 bug，应为 0）")
+    regress.add_argument("--min-agreement", type=float, default=1.0,
+                         help="--check 要求的实现一致率下限，默认 1.0")
+    regress.add_argument("--max-import-failures", type=int, default=0,
+                         help="--check 允许的导入失败条数，默认 0")
+    regress.add_argument("--max-structural-mismatch", type=int, default=0,
+                         help="--check 允许的结构不一致案例数，默认 0")
     return parser
 
 
@@ -180,7 +223,7 @@ def main(argv=None) -> int:
 
 def _run_regress(args) -> int:
     # 延迟导入：regress 依赖 case-analyzer 环境，generate/library 不依赖
-    from scenario_cases.regress import format_report, run_regression
+    from scenario_cases.regress import check_report, format_gates, format_report, run_regression
 
     try:
         report = run_regression(count=args.count, seed=args.seed, rows=args.rows,
@@ -190,6 +233,16 @@ def _run_regress(args) -> int:
         print(f"回归未开始：{error}", file=sys.stderr)
         return 2
     print(format_report(report))
+    if args.check:
+        result = check_report(report, gates={
+            "max_import_failures": args.max_import_failures,
+            "max_misjudged": args.max_misjudged,
+            "min_agreement": args.min_agreement,
+            "max_missed": args.max_missed,
+            "max_noise_candidates": args.max_noise_candidates,
+            "max_structural_mismatch": args.max_structural_mismatch})
+        print(format_gates(result))
+        return 0 if result["passed"] else 1
     return 0
 
 
@@ -201,16 +254,20 @@ def _run_generate(args) -> int:
     if unknown:
         print(f"未知模板：{', '.join(unknown)}；可用：{', '.join(PROFILE_NAMES)}", file=sys.stderr)
         return 2
+    if args.tag is not None and not TAG_PATTERN.fullmatch(args.tag):
+        print("--tag 只能包含字母、数字、-、_（1-24 字符）", file=sys.stderr)
+        return 2
     allowed = [name for name in args.profiles.split(",") if name]
     # 子集配比在局部归一化，不碰全局 MIX——原地改全局会让同进程内
     # 后续批次混进上一次的模板（roll 的上界变成权重和，直接错位）。
     weights = {name: MIX.get(name, 0.0) for name in allowed}
     total = sum(weights.values()) or 1.0
     mix = {name: weight / total for name, weight in weights.items()}
+    namespace = batch_tag(args.seed, args.rows, mix, args.tag)
 
-    files = generate_batch(args.out, args.count, args.rows, args.seed, mix)
+    files = generate_batch(args.out, args.count, args.rows, args.seed, mix, namespace)
     print(f"已生成 {args.count} 条场景 → {args.out}（{len(files)} 个文件，种子 {args.seed}，"
-          f"生成器 {GENERATOR_VERSION}）")
+          f"批次 {namespace}，生成器 {GENERATOR_VERSION}）")
     print("模板混合：" + "，".join(f"{name} {mix[name]:.0%}" for name in allowed))
     print("数据为公式合成的运动学级序列，不是道路采集或闭环仿真。")
     return 0

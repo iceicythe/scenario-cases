@@ -1,0 +1,53 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unit:
+    name: 单元测试（纯标准库）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # 场景生成/库/回归集/指标全部只依赖标准库；需要 case-analyzer 的
+      # 真跑用例在缺环境时自动跳过，不会误报失败。
+      - name: 跑全部单元测试
+        run: python -m unittest discover -s tests -v
+
+  regress-gate:
+    name: 闭环回归门禁（--check）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: scenario-cases
+      # 被评测工具检出到同级目录：regress 的默认 analyzer 路径就是
+      # <仓库根>/case-analyzer-oss，与本地开发布局一致。
+      - name: 检出被评测工具 case-analyzer
+        uses: actions/checkout@v4
+        with:
+          repository: iceicythe/case-analyzer
+          path: case-analyzer-oss
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 安装被评测工具依赖
+        run: pip install -r case-analyzer-oss/requirements.txt
+      # 固定种子=确定性批次：同样的代码必须给出同样的指标。
+      # 宽筛噪声容忍 0.3（固有成本，不要求零误报）；口径误判/实现不一致/
+      # 漏检/导入失败/结构不一致默认必须为 0——那些是实现 bug。
+      - name: 闭环回归 + 门禁
+        working-directory: scenario-cases
+        run: >
+          python -m scenario_cases regress --count 20 --seed 20261019
+          --out regression-out --check --max-noise-candidates 0.3
+      - name: 留存回归报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: regression-report
+          path: scenario-cases/regression-out/regression_report.json

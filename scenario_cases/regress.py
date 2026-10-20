@@ -17,6 +17,12 @@
 - 确认率/口径误判：口径层——事件被"自判符合口径"的候选覆盖才算确认；
   自判符合口径却没有真值事件支撑的候选，才是实现 bug。
 - 实现一致率：参考实现算出的事件集 vs 工具自带口径参考区间，逐条比对。
+
+误报指标按两个口径分别报（都**不是**经典假阳性率 FPR——FPR 的分母是
+FP+TN，本工具没有负例单位，套用这个名字只会引起歧义）：
+- 候选级"误报候选占比"：无真值支撑的候选项 ÷ 总候选项。衡量复核工作量；
+- 簇级"误报簇占比"：无真值支撑的候选簇 ÷ 总候选簇。衡量事件质量——
+  接力候选（两个候选接力盖住同一事件）在候选级会重复计数，簇级不会。
 """
 from __future__ import annotations
 
@@ -41,9 +47,9 @@ ACCELERATION_SOURCE = "由车速有限差分得到，不是独立传感器测量
 MEETS = "meets_numeric_rule"
 
 COUNTER_KEYS = ("cases", "truth_events", "detected_events", "confirmed_events",
-                "candidates", "false_positive_candidates", "misjudged_candidates",
-                "screening_noise_candidates", "candidate_clusters",
-                "structural_mismatch_cases")
+                "candidates", "false_positive_candidates", "false_positive_clusters",
+                "misjudged_candidates", "screening_noise_candidates",
+                "candidate_clusters", "structural_mismatch_cases")
 
 
 def default_analyzer_root() -> Path:
@@ -128,13 +134,20 @@ def score_cases(cases: dict, coverage_rule: float = COVERAGE_RULE) -> dict:
                         if merged_coverage(event, meets) >= coverage_rule - 1e-9)
         # 误报判定按候选簇：先合并成簇，再看簇有没有主要覆盖某个真值事件。
         # 接力盖住同一个事件的两个候选不各算一次误报——那是切碎，不是编造。
+        # 簇级计数用于事件质量口径；下面逐候选的列表保留候选级工作量口径，
+        # 每个候选标注所属簇，两个口径都能从同一份数据算出来。
         clusters = _merge(intervals)
+        cluster_best = [max((merged_coverage(event, [cluster]) for event in truth),
+                            default=0.0) for cluster in clusters]
+        false_positive_clusters = sum(1 for best in cluster_best
+                                      if best < coverage_rule - 1e-9)
         false_positives = []
         for candidate in case["candidates"]:
-            cluster = next(item for item in clusters
-                           if item[0] <= candidate["start_time"] + 1e-9
-                           and candidate["end_time"] <= item[1] + 1e-9)
-            best = max((merged_coverage(event, [cluster]) for event in truth), default=0.0)
+            cluster_index = next(i for i, item in enumerate(clusters)
+                                 if item[0] <= candidate["start_time"] + 1e-9
+                                 and candidate["end_time"] <= item[1] + 1e-9)
+            cluster = clusters[cluster_index]
+            best = cluster_best[cluster_index]
             if best < coverage_rule - 1e-9:
                 false_positives.append({"candidate_id": candidate.get("candidate_id"),
                                         "interval": [candidate["start_time"], candidate["end_time"]],
@@ -149,6 +162,7 @@ def score_cases(cases: dict, coverage_rule: float = COVERAGE_RULE) -> dict:
                  "truth_events": len(truth), "detected_events": len(detected),
                  "confirmed_events": confirmed,
                  "candidates": len(intervals), "false_positive_candidates": len(false_positives),
+                 "false_positive_clusters": false_positive_clusters,
                  "misjudged_candidates": misjudged,
                  "screening_noise_candidates": len(false_positives) - misjudged,
                  "candidate_clusters": len(clusters),
@@ -172,12 +186,14 @@ def score_cases(cases: dict, coverage_rule: float = COVERAGE_RULE) -> dict:
             "totals": dict(totals,
                            detection_rate=rate(totals["detected_events"], totals["truth_events"]),
                            confirmation_rate=rate(totals["confirmed_events"], totals["truth_events"]),
-                           false_positive_rate=rate(totals["false_positive_candidates"],
-                                                    totals["candidates"]),
-                           misjudged_rate=rate(totals["misjudged_candidates"],
-                                               totals["candidates"]),
-                           screening_noise_rate=rate(totals["screening_noise_candidates"],
-                                                     totals["candidates"])),
+                           false_positive_candidate_ratio=rate(
+                               totals["false_positive_candidates"], totals["candidates"]),
+                           false_positive_cluster_ratio=rate(
+                               totals["false_positive_clusters"], totals["candidate_clusters"]),
+                           misjudged_candidate_ratio=rate(totals["misjudged_candidates"],
+                                                          totals["candidates"]),
+                           screening_noise_candidate_ratio=rate(
+                               totals["screening_noise_candidates"], totals["candidates"])),
             "by_profile": by_profile,
             "boundary_cases": boundary,
             "cases": per_case}
@@ -313,7 +329,9 @@ def format_report(report: dict) -> str:
         f"真值事件 {totals['truth_events']} 个 · 检出 {totals['detected_events']} 个 · "
         f"检出率 {_percent(totals['detection_rate'])}（宽筛层）",
         f"候选 {totals['candidates']} 个 · 误报候选 {totals['false_positive_candidates']} 个 · "
-        f"误报率 {_percent(totals['false_positive_rate'])}（宽筛层）",
+        f"误报簇 {totals['false_positive_clusters']} 个 · "
+        f"误报候选占比 {_percent(totals['false_positive_candidate_ratio'])} · "
+        f"误报簇占比 {_percent(totals['false_positive_cluster_ratio'])}（宽筛层）",
         f"口径确认 {totals['confirmed_events']}/{totals['truth_events']}"
         f"（确认率 {_percent(totals['confirmation_rate'])}） · "
         f"口径误判候选 {totals['misjudged_candidates']} 个 · "
@@ -329,7 +347,8 @@ def format_report(report: dict) -> str:
         lines.append(
             f"  {profile:<14} 场景 {bucket['cases']:>3} · 事件 {bucket['truth_events']:>3} · "
             f"检出 {bucket['detected_events']:>3}（{_percent(_rate(bucket['detected_events'], bucket['truth_events']))}） · "
-            f"候选 {bucket['candidates']:>3} · 误报 {bucket['false_positive_candidates']:>3} "
+            f"候选 {bucket['candidates']:>3} · 误报候选 {bucket['false_positive_candidates']:>3} · "
+            f"误报簇 {bucket['false_positive_clusters']:>3} "
             f"（误判 {bucket['misjudged_candidates']} / 噪声 {bucket['screening_noise_candidates']}）")
     boundary = metrics["boundary_cases"]
     if boundary["cases"]:
@@ -337,7 +356,8 @@ def format_report(report: dict) -> str:
             "",
             f"贴边界/对抗样本（生成器标注）：{boundary['cases']} 条 · 检出率 "
             f"{_percent(_rate(boundary['detected_events'], boundary['truth_events']))} · "
-            f"误报率 {_percent(_rate(boundary['false_positive_candidates'], boundary['candidates']))} · "
+            f"误报候选占比 {_percent(_rate(boundary['false_positive_candidates'], boundary['candidates']))} · "
+            f"误报簇占比 {_percent(_rate(boundary['false_positive_clusters'], boundary['candidate_clusters']))} · "
             f"口径误判 {boundary['misjudged_candidates']} 个",
         ]
     for failure in report["import_failures"]:
@@ -367,6 +387,63 @@ def format_report(report: dict) -> str:
 
 def _rate(numerator, denominator):
     return round(numerator / denominator, 4) if denominator else None
+
+
+# --check 门禁的默认阈值。宽筛层噪声有固有成本（评审原话：不宜要求零误报），
+# 所以噪声只设容忍上限；口径误判和实现不一致是实现 bug，默认必须为 0/100%。
+DEFAULT_GATES = {"max_import_failures": 0, "max_misjudged": 0, "min_agreement": 1.0,
+                 "max_missed": 0, "max_noise_candidates": 0.25,
+                 "max_structural_mismatch": 0}
+
+
+def check_report(report: dict, gates: dict | None = None) -> dict:
+    """对回归报告逐项过门禁，返回 {passed, gates:[{gate, actual, limit, ok, message}]}。
+
+    设计成纯函数：CI 与本地共用同一判定，测试可以直接喂报告进来自动判别。
+    噪声占比无定义（整批零候选）时不算未过——那种情况由漏检门禁兜底。
+    """
+    limits = {**DEFAULT_GATES, **(gates or {})}
+    totals = report["metrics"]["totals"]
+    agreement = report.get("agreement") or {}
+    noise = totals.get("false_positive_candidate_ratio")
+    missed = totals["truth_events"] - totals["detected_events"]
+
+    def gate(name, ok, actual, limit, message):
+        return {"gate": name, "ok": bool(ok), "actual": actual, "limit": limit,
+                "message": message}
+
+    results = [
+        gate("导入完整性", len(report["import_failures"]) <= limits["max_import_failures"],
+             len(report["import_failures"]), limits["max_import_failures"],
+             f"导入失败 {len(report['import_failures'])} 条"),
+        gate("口径误判", totals["misjudged_candidates"] <= limits["max_misjudged"],
+             totals["misjudged_candidates"], limits["max_misjudged"],
+             f"自判符合口径却无真值支撑的候选 {totals['misjudged_candidates']} 个（实现 bug）"),
+        gate("实现一致", (agreement.get("agreement_rate") or 0.0) >= limits["min_agreement"],
+             agreement.get("agreement_rate"), limits["min_agreement"],
+             f"参考实现与工具口径区间一致 {agreement.get('matching', 0)}/"
+             f"{agreement.get('cases', 0)}"),
+        gate("漏检事件", missed <= limits["max_missed"], missed, limits["max_missed"],
+             f"漏检真值事件 {missed} 个"),
+        gate("宽筛噪声", noise is None or noise <= limits["max_noise_candidates"],
+             noise, limits["max_noise_candidates"],
+             f"误报候选占比 {_percent(noise)}"),
+        gate("结构一致", totals["structural_mismatch_cases"] <= limits["max_structural_mismatch"],
+             totals["structural_mismatch_cases"], limits["max_structural_mismatch"],
+             f"候选簇数与真值事件数不一致的案例 {totals['structural_mismatch_cases']} 个"),
+    ]
+    return {"passed": all(item["ok"] for item in results), "gates": results,
+            "limits": limits}
+
+
+def format_gates(result: dict) -> str:
+    lines = ["回归门禁（--check）："]
+    for item in result["gates"]:
+        mark = "PASS" if item["ok"] else "FAIL"
+        lines.append(f"  [{mark}] {item['gate']}：{item['message']}"
+                     f"（上限 {item['limit']}）")
+    lines.append("结论：" + ("全部通过" if result["passed"] else "存在未过项，退出码非零"))
+    return "\n".join(lines)
 
 
 def _percent(value):

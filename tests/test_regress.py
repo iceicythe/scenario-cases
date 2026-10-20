@@ -4,9 +4,9 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from scenario_cases.regress import (COVERAGE_RULE, default_analyzer_root, format_report,
-                                    locate_analyzer, merged_coverage, run_regression,
-                                    score_cases)
+from scenario_cases.regress import (COVERAGE_RULE, check_report, default_analyzer_root,
+                                    format_gates, format_report, locate_analyzer,
+                                    merged_coverage, run_regression, score_cases)
 
 MEETS = "meets_numeric_rule"
 BELOW = "below_numeric_rule"
@@ -55,7 +55,8 @@ class ScoreCasesTest(unittest.TestCase):
         cases = {"s1": fake_case("hard_brake", [event(10, 16)], [candidate("C001", 10, 16)])}
         result = score_cases(cases)
         self.assertEqual(result["totals"]["detection_rate"], 1.0)
-        self.assertEqual(result["totals"]["false_positive_rate"], 0.0)
+        self.assertEqual(result["totals"]["false_positive_candidate_ratio"], 0.0)
+        self.assertEqual(result["totals"]["false_positive_cluster_ratio"], 0.0)
         self.assertEqual(result["totals"]["confirmation_rate"], 1.0)
         self.assertEqual(result["totals"]["misjudged_candidates"], 0)
 
@@ -72,12 +73,30 @@ class ScoreCasesTest(unittest.TestCase):
         cases = {"s1": fake_case("cruise", [], [candidate("C001", 5, 9)])}
         result = score_cases(cases)
         self.assertIsNone(result["totals"]["detection_rate"])  # 没有真值事件
-        self.assertEqual(result["totals"]["false_positive_rate"], 1.0)
+        self.assertEqual(result["totals"]["false_positive_candidate_ratio"], 1.0)
+        self.assertEqual(result["totals"]["false_positive_cluster_ratio"], 1.0)
 
     def test_clean_negative_sample(self):
         cases = {"s1": fake_case("cruise", [], [])}
-        # 没有任何候选时误报率无定义（None），不是 0——没有分母就没有率
-        self.assertIsNone(score_cases(cases)["totals"]["false_positive_rate"])
+        # 没有任何候选时两个口径的误报率都无定义（None），不是 0——没有分母就没有率
+        self.assertIsNone(score_cases(cases)["totals"]["false_positive_candidate_ratio"])
+        self.assertIsNone(score_cases(cases)["totals"]["false_positive_cluster_ratio"])
+
+    def test_false_positive_two_calibers_differ(self):
+        # 评审反例固化：一个正确候选 + 一个由两个重叠候选组成的错误簇。
+        # 候选级 2/3（接力候选各算一次，衡量复核工作量）；
+        # 簇级 1/2（重叠候选同簇只算一次，衡量事件质量）。
+        cases = {"s1": fake_case("hard_brake", [event(10, 12)],
+                                 [candidate("C001", 10, 12),
+                                  candidate("C002", 30, 30.5, BELOW),
+                                  candidate("C003", 30.2, 30.6, BELOW)])}
+        totals = score_cases(cases)["totals"]
+        self.assertEqual(totals["candidates"], 3)
+        self.assertEqual(totals["false_positive_candidates"], 2)
+        self.assertEqual(totals["false_positive_clusters"], 1)
+        # rate() 保留 4 位小数，比对时留出取整余量
+        self.assertAlmostEqual(totals["false_positive_candidate_ratio"], 2 / 3, places=3)
+        self.assertAlmostEqual(totals["false_positive_cluster_ratio"], 0.5, places=3)
 
     def test_two_candidates_cover_one_event(self):
         # 真值 10~20 被 10~15 与 15~20 两个候选接力覆盖：检出，两个都不是误报
@@ -104,7 +123,7 @@ class ScoreCasesTest(unittest.TestCase):
         self.assertEqual(result["totals"]["false_positive_candidates"], 1)
         self.assertEqual(result["totals"]["misjudged_candidates"], 1)
         self.assertEqual(result["totals"]["screening_noise_candidates"], 0)
-        self.assertEqual(result["totals"]["misjudged_rate"], 1.0)
+        self.assertEqual(result["totals"]["misjudged_candidate_ratio"], 1.0)
 
     def test_screening_noise_separate_from_misjudge(self):
         # 亚门槛样本被宽筛捞出、但工具自判低于数值规则：宽筛固有噪声，不是 bug
@@ -150,6 +169,65 @@ class ScoreCasesTest(unittest.TestCase):
         self.assertEqual(score_cases(cases, coverage_rule=0.5)["totals"]["detection_rate"], 1.0)
 
 
+class CheckReportTest(unittest.TestCase):
+    """--check 门禁：纯函数判定，每项单独可测。"""
+
+    def _report(self, *, import_failures=0, misjudged=0, agreement_rate=1.0,
+                matching=2, cases=2, missed=0, noise=None, structural=0):
+        truth_events, detected = 2, 2 - missed
+        return {"import_failures": [{"case_id": "s", "status": "failed", "message": "x"}] * import_failures,
+                "metrics": {"totals": {"truth_events": truth_events,
+                                       "detected_events": detected,
+                                       "misjudged_candidates": misjudged,
+                                       "false_positive_candidate_ratio": noise,
+                                       "structural_mismatch_cases": structural}},
+                "agreement": {"cases": cases, "matching": matching,
+                              "agreement_rate": agreement_rate, "mismatches": []}}
+
+    def test_all_gates_pass(self):
+        result = check_report(self._report())
+        self.assertTrue(result["passed"])
+        self.assertEqual(len(result["gates"]), 6)
+
+    def test_import_failure_blocks(self):
+        result = check_report(self._report(import_failures=1))
+        self.assertFalse(result["passed"])
+        failed = [item for item in result["gates"] if not item["ok"]]
+        self.assertEqual(failed[0]["gate"], "导入完整性")
+
+    def test_misjudged_candidate_blocks(self):
+        # 口径误判是实现 bug，默认一个都不能有
+        self.assertFalse(check_report(self._report(misjudged=1))["passed"])
+
+    def test_agreement_below_one_blocks(self):
+        self.assertFalse(check_report(self._report(agreement_rate=0.5))["passed"])
+
+    def test_missed_event_blocks(self):
+        result = check_report(self._report(missed=1))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any(item["gate"] == "漏检事件" and not item["ok"]
+                            for item in result["gates"]))
+
+    def test_noise_above_limit_blocks_but_none_passes(self):
+        self.assertFalse(check_report(self._report(noise=0.3))["passed"])
+        # 整批零候选时噪声无定义：不算未过（漏检门禁会兜底）
+        self.assertTrue(check_report(self._report(noise=None))["passed"])
+
+    def test_noise_limit_is_overridable(self):
+        # 宽筛固有噪声只设容忍上限，阈值可由调用方声明
+        self.assertTrue(check_report(self._report(noise=0.3),
+                                     gates={"max_noise_candidates": 0.5})["passed"])
+
+    def test_structural_mismatch_blocks(self):
+        self.assertFalse(check_report(self._report(structural=1))["passed"])
+
+    def test_format_gates_marks_each_item(self):
+        text = format_gates(check_report(self._report(misjudged=1)))
+        self.assertIn("[PASS] 导入完整性", text)
+        self.assertIn("[FAIL] 口径误判", text)
+        self.assertIn("退出码非零", text)
+
+
 class LocateAnalyzerTest(unittest.TestCase):
     def test_default_root_points_at_sibling_repo(self):
         root = default_analyzer_root()
@@ -187,17 +265,21 @@ class FormatReportTest(unittest.TestCase):
                 "metrics": {"totals": {"cases": 2, "truth_events": 2, "detected_events": 1,
                                        "confirmed_events": 1, "candidates": 3,
                                        "false_positive_candidates": 1,
+                                       "false_positive_clusters": 0,
                                        "misjudged_candidates": 0,
                                        "screening_noise_candidates": 1,
                                        "candidate_clusters": 3,
                                        "structural_mismatch_cases": 0,
                                        "detection_rate": 0.5, "confirmation_rate": 0.5,
-                                       "false_positive_rate": 1 / 3, "misjudged_rate": 0.0,
-                                       "screening_noise_rate": 1 / 3},
+                                       "false_positive_candidate_ratio": 1 / 3,
+                                       "false_positive_cluster_ratio": 0.0,
+                                       "misjudged_candidate_ratio": 0.0,
+                                       "screening_noise_candidate_ratio": 1 / 3},
                             "by_profile": {"hard_brake": {"cases": 1, "truth_events": 1,
                                                           "detected_events": 1,
                                                           "confirmed_events": 1, "candidates": 1,
                                                           "false_positive_candidates": 0,
+                                                          "false_positive_clusters": 0,
                                                           "misjudged_candidates": 0,
                                                           "screening_noise_candidates": 0,
                                                           "candidate_clusters": 1,
@@ -205,9 +287,9 @@ class FormatReportTest(unittest.TestCase):
                             "boundary_cases": dict.fromkeys(
                                 ("cases", "truth_events", "detected_events",
                                  "confirmed_events", "candidates",
-                                 "false_positive_candidates", "misjudged_candidates",
-                                 "screening_noise_candidates", "candidate_clusters",
-                                 "structural_mismatch_cases"), 0),
+                                 "false_positive_candidates", "false_positive_clusters",
+                                 "misjudged_candidates", "screening_noise_candidates",
+                                 "candidate_clusters", "structural_mismatch_cases"), 0),
                             "cases": []},
                 "agreement": {"cases": 2, "matching": 2, "agreement_rate": 1.0,
                               "mismatches": []},
@@ -216,7 +298,8 @@ class FormatReportTest(unittest.TestCase):
     def test_summary_contains_key_numbers(self):
         text = format_report(self._report())
         self.assertIn("检出率 50.0%", text)
-        self.assertIn("误报率 33.3%", text)
+        self.assertIn("误报候选占比 33.3%", text)
+        self.assertIn("误报簇占比 0.0%", text)
         self.assertIn("确认率 50.0%", text)
         self.assertIn("口径误判候选 0 个", text)
         self.assertIn("口径实现一致 2/2", text)
@@ -276,6 +359,22 @@ class RunRegressionIntegrationTest(unittest.TestCase):
             self.assertEqual(report["source"]["type"], "synthetic")
             self.assertIn("不是道路采集", report["source"]["note"])
             self.assertIn("参考实现", report["truth_basis"])
+
+    def test_check_mode_exit_codes(self):
+        # --check 的门禁判定与退出码：固定小批，噪声容忍放宽到 0.5 避免小样本波动；
+        # 不可能达到的 min-agreement 必须走失败路径（退出码 1）。
+        from scenario_cases.cli import main
+
+        with TemporaryDirectory() as temporary:
+            out = str(Path(temporary) / "run")
+            base = ["regress", "--count", "3", "--rows", "60", "--seed", "7", "--out", out]
+            import contextlib
+            import io
+            with contextlib.redirect_stdout(io.StringIO()):
+                passed = main(base + ["--check", "--max-noise-candidates", "0.5"])
+                failed = main(base + ["--check", "--min-agreement", "1.01"])
+        self.assertEqual(passed, 0)
+        self.assertEqual(failed, 1)
 
 
 if __name__ == "__main__":
