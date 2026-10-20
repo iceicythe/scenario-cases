@@ -10,7 +10,7 @@ from pathlib import Path
 
 from scenario_cases.generator import GENERATOR_VERSION, build_case, write_case
 from scenario_cases.models import ScenarioSpec
-from scenario_cases.store import TRUTH_FILE, ScenarioLibrary
+from scenario_cases.store import TRUTH_FILE, ScenarioError, ScenarioLibrary, SuiteError
 from scenario_cases.templates import (DEFAULTS, PROFILE_NAMES, param_range)
 
 # 批量时的模板配比：典型组占六成，对抗组占三成，负样本一成。
@@ -100,7 +100,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     listing = lib_sub.add_parser("list", help="按条件检索场景")
     listing.add_argument("--db", type=Path, default=DEFAULT_DB)
-    listing.add_argument("--profile", help="按车速曲线模板筛选，如 hard_brake")
+    listing.add_argument("--profile", help="按车速曲线模板筛选，如 hard_brake；"
+                                           "逗号分隔可多选，如 sub_threshold,jitter")
     listing.add_argument("--event", help="按真值事件类型筛选，如 deceleration")
     listing.add_argument("--min-decel", type=float, help="减速度下限（m/s²）")
     listing.add_argument("--max-decel", type=float, help="减速度上限（m/s²）")
@@ -122,6 +123,34 @@ def build_parser() -> argparse.ArgumentParser:
     stats = lib_sub.add_parser("stats", help="库整体统计")
     stats.add_argument("--db", type=Path, default=DEFAULT_DB)
 
+    suite = sub.add_parser("suite", help="回归集：按查询条件固化命名快照，导出带标准答案的卷子")
+    suite_sub = suite.add_subparsers(dest="suite_command", required=True)
+
+    suite_add = suite_sub.add_parser("add", help="按查询条件创建回归集（成员存快照）")
+    suite_add.add_argument("name", help="回归集名字，如 smoke-v1")
+    suite_add.add_argument("--db", type=Path, default=DEFAULT_DB)
+    suite_add.add_argument("--profile", help="按车速曲线模板筛选，如 hard_brake；"
+                                             "逗号分隔可多选，如 sub_threshold,jitter")
+    suite_add.add_argument("--event", help="按真值事件类型筛选，如 deceleration")
+    suite_add.add_argument("--min-decel", type=float, help="减速度下限（m/s²）")
+    suite_add.add_argument("--max-decel", type=float, help="减速度上限（m/s²）")
+    suite_add.add_argument("--min-v0", type=float, help="初速度下限（m/s）")
+    suite_add.add_argument("--max-v0", type=float, help="初速度上限（m/s）")
+    suite_add.add_argument("--with-events", choices=["yes", "no"],
+                           help="只要 有/没有 真值事件的场景")
+
+    suite_list = suite_sub.add_parser("list", help="列出所有回归集")
+    suite_list.add_argument("--db", type=Path, default=DEFAULT_DB)
+
+    suite_show = suite_sub.add_parser("show", help="查看回归集详情（成员与真值事件数）")
+    suite_show.add_argument("name")
+    suite_show.add_argument("--db", type=Path, default=DEFAULT_DB)
+
+    suite_export = suite_sub.add_parser("export", help="导出整个回归集（场景目录 + manifest.json）")
+    suite_export.add_argument("name")
+    suite_export.add_argument("out", type=Path, help="输出目录")
+    suite_export.add_argument("--db", type=Path, default=DEFAULT_DB)
+
     regress = sub.add_parser("regress", help="闭环回归：生成 → case-analyzer 全跑 → 对真值 → 检出率/误报率")
     regress.add_argument("--count", type=int, default=20, help="场景条数，默认 20")
     regress.add_argument("--seed", type=int, default=20261019, help="随机种子，可复现")
@@ -142,6 +171,8 @@ def main(argv=None) -> int:
         return _run_generate(args)
     if args.command == "library":
         return _run_library(args)
+    if args.command == "suite":
+        return _run_suite(args)
     if args.command == "regress":
         return _run_regress(args)
     return 2
@@ -220,11 +251,7 @@ def _run_library(args) -> int:
         return 1 if summary["failed"] else 0
 
     if args.library_command == "list":
-        with_events = {"yes": True, "no": False}.get(args.with_events)
-        records = library.query(profile=args.profile, event_kind=args.event,
-                                min_decel=args.min_decel, max_decel=args.max_decel,
-                                min_v0=args.min_v0, max_v0=args.max_v0,
-                                with_events=with_events)
+        records = library.query(**_query_kwargs(args))
         if args.json:
             print(json.dumps([record.as_dict() for record in records],
                              ensure_ascii=False, indent=2))
@@ -257,6 +284,58 @@ def _run_library(args) -> int:
         for profile, count in summary["by_profile"].items():
             print(f"  {profile}: {count}")
         return 0
+    return 2
+
+
+def _query_kwargs(args) -> dict:
+    """library list 与 suite add 共用的查询条件解析（含 with-events 三元转换、
+    profile 逗号分隔多模板拆分为列表）。"""
+    profiles = [name for name in (args.profile or "").split(",") if name]
+    return {"profile": profiles or None, "event_kind": args.event,
+            "min_decel": args.min_decel, "max_decel": args.max_decel,
+            "min_v0": args.min_v0, "max_v0": args.max_v0,
+            "with_events": {"yes": True, "no": False}.get(args.with_events)}
+
+
+def _run_suite(args) -> int:
+    library = ScenarioLibrary(args.db)
+    try:
+        if args.suite_command == "add":
+            records = library.query(**_query_kwargs(args))
+            if not records:
+                print("查询没有命中任何场景，回归集未创建", file=sys.stderr)
+                return 1
+            suite = library.create_suite(args.name, _query_kwargs(args), records)
+            print(f"回归集 {suite.name!r} 已创建：{len(suite.scenario_ids)} 条场景、"
+                  f"{suite.event_total} 个真值事件（成员为快照，库后续新增不影响）")
+            return 0
+
+        if args.suite_command == "list":
+            suites = library.list_suites()
+            for suite in suites:
+                print(f"{suite.name}  {len(suite.scenario_ids)} 条 · "
+                      f"{suite.event_total} 事件 · 建于 {suite.created_at}")
+            print(f"共 {len(suites)} 个")
+            return 0
+
+        if args.suite_command == "show":
+            suite = library.get_suite(args.name)
+            if suite is None:
+                print(f"回归集 {args.name!r} 不存在", file=sys.stderr)
+                return 1
+            print(json.dumps(suite.as_dict(), ensure_ascii=False, indent=2))
+            return 0
+
+        if args.suite_command == "export":
+            manifest = library.export_suite(args.name, args.out)
+            suite = library.get_suite(args.name)
+            print(f"回归集 {args.name!r} 已导出 → {args.out}"
+                  f"（{len(suite.scenario_ids)} 条场景 + manifest.json，字节级一致）")
+            print(f"清单文件：{manifest}")
+            return 0
+    except (SuiteError, ScenarioError) as error:
+        print(str(error), file=sys.stderr)
+        return 1
     return 2
 
 

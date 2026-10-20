@@ -65,6 +65,31 @@ python -m scenario_cases library stats --db ./library.db
 单机单人工具、要能一键拷走）；文件内容随元数据入库 = 源目录删了也能原样导出；
 常用检索轴（profile / v0 / decel / duration / at）建成列，完整参数另存 JSON，范围查询走列、信息不丢。
 
+## 回归集（suite）：把一次挑选固化成"同一套卷子"
+
+评测要可比，两次跑的必须是同一批场景。`suite` 把一次查询结果固化为命名快照：
+
+```shell
+# 按查询条件创建（条件与 library list 相同）
+python -m scenario_cases suite add brake-v1 --profile hard_brake --db ./library.db
+
+# 列出、查看、导出
+python -m scenario_cases suite list --db ./library.db
+python -m scenario_cases suite show brake-v1 --db ./library.db
+python -m scenario_cases suite export brake-v1 ./regression/brake-v1 --db ./library.db
+```
+
+导出的目录每个场景一个子目录（字节级一致），顶层一份 `manifest.json`：
+suite 元信息、逐场景真值事件与参数、内容指纹——下游拿 manifest 即可对答案，
+不必解析每份 truth.json。
+
+**关键取舍：suite 存成员快照，不只存查询条件。** 只存条件的话，库里每新增一条
+场景，回归集成员就悄悄变了——两次评测跑的其实不是同一套卷子，指标不可比。
+查询条件只作为 provenance 记录在案（"这个集当初是怎么挑的"）。
+
+造数据、读指标的方法论沉淀在 [docs/EVAL_CHECKLIST.md](docs/EVAL_CHECKLIST.md)：
+真值怎么避免循环论证、对抗样本参数怎么反推、双层指标怎么分开读。
+
 ## 场景模板
 
 | 模板 | 行为 | 真值事件（口径参考实现算出） |
@@ -153,6 +178,7 @@ python -B -m unittest discover -s tests -v
 覆盖模板数学性质（门槛/范围/单调性、对抗组形状保证）、口径参考实现（窗口三条件逐一隔离、
 合并与搭桥、端到端事件）、生成器输出（表头、网格、真值一致性、来源声明）、
 命令行（批量、可复现、参数校验）、场景库（去重、检索、导出、持久化、CLI 往返）、
+回归集（快照语义、查询创建、manifest 结构、导出字节级一致、CLI 往返、旧库补表迁移）、
 闭环指标（覆盖合并、双层判定、结构差异、analyzer 定位）。闭环回归的真跑用例需要
 case-analyzer 源码及其 pandas/numpy 环境，缺失时自动跳过（不报错）。
 
@@ -162,7 +188,8 @@ case-analyzer 源码及其 pandas/numpy 环境，缺失时自动跳过（不报�
 - [x] W3：场景库入库（SQLite 单文件、sha256 指纹去重、按参数检索、原样导出）
 - [x] W4：闭环回归（生成 → 调用 case-analyzer 全跑 → 对真值 → 检出率/误报率报告）
 - [x] W5：口径参考实现 + 对抗样本（真值不再循环论证；双层指标；实现一致性比对）
-- [ ] W6：回归集导出、checklist 沉淀（视进度取舍）
+- [x] W6：回归集导出（suite 快照 + manifest）+ 评测 checklist 沉淀
+  （[docs/EVAL_CHECKLIST.md](docs/EVAL_CHECKLIST.md)）
 
 明确不做：物理引擎、传感器建模、3D 渲染、CARLA/SUMO 集成、强化学习。
 

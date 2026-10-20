@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 LIBRARY_VERSION = "scenario-library-0.1.0"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2 增加 suites 表（回归集快照）
 
 DATA_FILES = ("vehicle_state.csv", "object_state.csv", "planning_state.csv", "control_state.csv")
 TRUTH_FILE = "truth.json"
@@ -56,11 +56,50 @@ SCHEMA_STATEMENTS = (
         content BLOB NOT NULL,
         PRIMARY KEY (scenario_id, name)
     )""",
+    """CREATE TABLE IF NOT EXISTS suites (
+        suite_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL UNIQUE,
+        query TEXT NOT NULL,
+        scenario_ids TEXT NOT NULL,
+        event_total INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    )""",
 )
 
 
 class ScenarioError(Exception):
     """场景目录不合法：缺文件、JSON 损坏、结构不符、id 冲突等。"""
+
+
+class SuiteError(Exception):
+    """回归集操作失败：名字重复、不存在等。"""
+
+
+@dataclass(frozen=True)
+class SuiteRecord:
+    suite_id: int
+    name: str
+    query: dict          # 创建时的查询条件（provenance，不参与成员判定）
+    scenario_ids: tuple  # 成员快照
+    event_total: int
+    created_at: str
+
+    def as_dict(self) -> dict:
+        return {
+            "suite_id": self.suite_id,
+            "name": self.name,
+            "query": self.query,
+            "scenario_ids": list(self.scenario_ids),
+            "scenario_count": len(self.scenario_ids),
+            "event_total": self.event_total,
+            "created_at": self.created_at,
+        }
+
+
+def _suite_record(row) -> SuiteRecord:
+    return SuiteRecord(
+        suite_id=row[0], name=row[1], query=json.loads(row[2]),
+        scenario_ids=tuple(json.loads(row[3])), event_total=row[4], created_at=row[5])
 
 
 @dataclass(frozen=True)
@@ -178,7 +217,8 @@ class ScenarioLibrary:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as db:
-            if not db.execute("PRAGMA user_version").fetchone()[0]:
+            # 旧库打开时幂等补建新表并升版本；user_version 已是新版则不动
+            if db.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
                 db.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @contextmanager
@@ -254,10 +294,15 @@ class ScenarioLibrary:
 
     def query(self, *, profile=None, event_kind=None, min_decel=None, max_decel=None,
               min_v0=None, max_v0=None, with_events=None) -> list:
+        """按条件检索。profile 接受单个模板或模板列表（对应 --profile a,b 的组筛选，
+        如一次选出整个对抗组）。"""
         clauses, params = [], []
         if profile is not None:
-            clauses.append("profile = ?")
-            params.append(profile)
+            names = [profile] if isinstance(profile, str) else list(profile)
+            if not names:
+                raise ValueError("profile 列表不能为空")
+            clauses.append(f"profile IN ({','.join('?' * len(names))})")
+            params.extend(names)
         if event_kind is not None:
             clauses.append("EXISTS (SELECT 1 FROM events e"
                            " WHERE e.scenario_id = scenarios.scenario_id AND e.kind = ?)")
@@ -316,3 +361,93 @@ class ScenarioLibrary:
                 "SELECT COALESCE(SUM(rows), 0) FROM scenarios").fetchone()[0]
         return {"total": total, "by_profile": by_profile, "with_events": with_events,
                 "without_events": total - with_events, "rows_total": rows_total}
+
+    # ---- 回归集（suite）：把一次查询结果固化成命名快照 ----
+    #
+    # 设计取舍（面试可讲）：suite 存**快照 id 列表**而不是只存查询条件。
+    # 只存条件的话，库里每新增一条场景，回归集的成员就悄悄变了——
+    # 两次评测跑的其实不是同一套卷子，指标不可比。条件只作为 provenance
+    # 记录在案（"这个集当初是怎么挑的"），成员以快照为准。
+
+    def create_suite(self, name: str, query: dict, records: list) -> SuiteRecord:
+        """把一批查询结果固化为命名回归集。同名抛 SuiteError。"""
+        scenario_ids = sorted(record.scenario_id for record in records)
+        event_total = sum(record.event_count for record in records)
+        with self._connect() as db:
+            if db.execute("SELECT 1 FROM suites WHERE name = ?", (name,)).fetchone():
+                raise SuiteError(f"回归集 {name!r} 已存在；换名字或先删除")
+            cursor = db.execute(
+                "INSERT INTO suites (name, query, scenario_ids, event_total, created_at)"
+                " VALUES (?,?,?,?,?)",
+                (name, json.dumps(query, ensure_ascii=False, sort_keys=True),
+                 json.dumps(scenario_ids, ensure_ascii=False), event_total, _now()))
+            row = db.execute("SELECT suite_id, name, query, scenario_ids, event_total,"
+                             " created_at FROM suites WHERE suite_id = ?",
+                             (cursor.lastrowid,)).fetchone()
+        return _suite_record(row)
+
+    def list_suites(self) -> list:
+        with self._connect() as db:
+            rows = db.execute("SELECT suite_id, name, query, scenario_ids, event_total,"
+                              " created_at FROM suites ORDER BY suite_id").fetchall()
+        return [_suite_record(row) for row in rows]
+
+    def get_suite(self, name: str) -> SuiteRecord | None:
+        with self._connect() as db:
+            row = db.execute("SELECT suite_id, name, query, scenario_ids, event_total,"
+                             " created_at FROM suites WHERE name = ?", (name,)).fetchone()
+        return _suite_record(row) if row else None
+
+    def suite_members(self, name: str) -> list:
+        """回归集当前的成员记录（库里被删过的场景不出现在结果里，保持集合完整语义）。"""
+        suite = self.get_suite(name)
+        if suite is None:
+            raise SuiteError(f"回归集 {name!r} 不存在")
+        records = []
+        for scenario_id in suite.scenario_ids:
+            record = self.get(scenario_id)
+            if record is not None:
+                records.append(record)
+        return records
+
+    def export_suite(self, name: str, directory) -> Path:
+        """导出整个回归集：每个场景一个子目录（字节级一致）+ 顶层 manifest.json。
+
+        manifest 是"带标准答案的卷子"的可交付形态：suite 元信息、逐场景
+        真值事件与参数摘要、内容指纹。下游工具拿 manifest 即可对答案，
+        不必自己解析每份 truth.json。
+        """
+        suite = self.get_suite(name)
+        if suite is None:
+            raise SuiteError(f"回归集 {name!r} 不存在")
+        records = self.suite_members(name)
+        directory = Path(directory)
+        directory.mkdir(parents=True, exist_ok=True)
+        scenarios = []
+        for record in records:
+            target = directory / record.scenario_id
+            self.export(record.scenario_id, target)
+            scenarios.append({
+                "scenario_id": record.scenario_id,
+                "profile": record.profile,
+                "params": record.params,
+                "rows": record.rows,
+                "events": [{"kind": kind, "start": start, "end": end}
+                           for kind, start, end in record.events],
+                "fingerprint": record.fingerprint,
+            })
+        manifest = {
+            "manifest_version": 1,
+            "suite": suite.as_dict(),
+            "scenarios": scenarios,
+            "counts": {
+                "scenarios": len(scenarios),
+                "events": sum(record.event_count for record in records),
+                "with_events": sum(1 for record in records if record.event_count),
+                "without_events": sum(1 for record in records if not record.event_count),
+            },
+        }
+        manifest_path = directory / "manifest.json"
+        manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                                 encoding="utf-8")
+        return manifest_path
