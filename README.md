@@ -1,21 +1,48 @@
 # scenario-cases
 
-**运动学级仿真场景生成器：造"带标准答案的卷子"，用来检验智驾测试分析工具的检出率与误报率。**
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.11%2B-blue.svg)](https://www.python.org/)
 
-每条场景按参数化模板生成四路 CSV 日志（车辆/目标/规划/控制，格式与 case-analyzer 输入约定一致），
-并同时产出一份真值 `truth.json`：**按 SD-WINDOW-1.1 口径从生成数据独立算出的事件窗口**、
-场景参数与设计备注。
-生成 → 交给分析工具跑 → 与真值对比 → 出指标，这条闭环就是本项目要支撑的东西。
+**智驾测试分析工具的"带标准答案的卷子"：运动学级仿真场景生成器 + 场景库 + 闭环回归。**
 
-**诚实声明**：本项目生成的是运动学级数据（时间-速度序列 + 简单目标运动），
-**不是**物理级仿真、传感器仿真或 3D 仿真，也不用于评估车辆性能；
-它的唯一目的是给测试分析工具提供带已知答案的评测数据。
+造一批带已知答案的测试场景 → 交给分析工具跑 → 与真值对比 → 输出检出率/误报率。
+整条闭环零第三方依赖、同种子完全可复现，用来回答一个问题：
+**你的减速事件检测工具，到底能检出多少、会误报多少、在边界样本上会不会错？**
+
+> **诚实声明**：本项目生成的是运动学级数据（时间-速度序列 + 简单目标运动），
+> **不是**物理级仿真、传感器仿真或 3D 仿真，也不用于评估车辆性能。
+> 它的唯一目的是给测试分析工具提供带已知答案的评测数据。
+
+## 它解决什么问题
+
+- **效果没法量化**：检测工具"准不准"不能靠感觉，需要带已知答案的数据才能算检出率/误报率；
+- **真实数据标注贵**：路采数据逐帧标注成本高，且急刹、贴边界样本可遇不可求；
+- **指标不可比**：每次随手挑一批数据评测，下次换一批，数字对不上——需要固化的回归集；
+- **循环论证**：很多自测工具按注入的参数造数据、再按同一套假设检测，"100% 检出"只证明两边代码没写岔。
+
+本项目针对这四点分别给出：合成数据、对抗样本、回归集快照、独立重算的真值。
+
+## 功能特性
+
+- **参数化模板**：9 个车速曲线模板（4 个典型组 + 5 个对抗组），每条场景独立可复现
+- **四路 CSV 日志**：车辆/目标/规划/控制，格式与 [case-analyzer](https://github.com/iceicythe/case-analyzer) 的输入约定一致
+- **真值独立重算**：`truth.json` 的事件窗口由独立实现的口径计算器从生成数据现场算出，不记录"注入了什么"——不与被评测工具共享假设
+- **单文件场景库**：SQLite 单文件存储，内容指纹去重、按模板/参数范围检索、字节级原样导出
+- **回归集（suite）**：把一次挑选固化为命名快照，保证两次评测跑的是同一套卷子
+- **闭环回归**：一条命令跑完 生成 → 导入分析工具 → 规则筛选 → 对真值 → 双层指标报告
+
+## 环境要求
+
+- Python 3.11+；`generate` / `library` / `suite` **除标准库外零依赖**
+- `regress` 子命令需要 [case-analyzer](https://github.com/iceicythe/case-analyzer) 的运行环境（其依赖 pandas/numpy）
 
 ## 快速开始
 
-无第三方依赖，Python 3.11+：
-
 ```shell
+git clone https://github.com/iceicythe/scenario-cases.git
+cd scenario-cases
+
+# 在仓库根目录执行（包以目录形式被引用）
 python -m scenario_cases generate --out ./generated/batch_001 --count 20 --seed 20261018
 ```
 
@@ -34,9 +61,11 @@ generated/batch_001/
 └── ...
 ```
 
-相同 `--seed` 结果完全可复现；`--profiles hard_brake,cruise` 可指定参与混合的模板（局部归一化配比）。
+相同 `--seed` 结果完全可复现；`--profiles hard_brake,cruise` 可指定参与混合的模板（配比局部归一化）。
 
-## 场景库（SQLite 单文件）
+## 使用指南
+
+### 场景库
 
 生成的一批场景可以登记进一个单文件 SQLite 库：元数据、真值事件与文件内容一起入库，
 按内容指纹去重（内容相同即重复，与目录位置无关），支持按模板、事件类型、参数范围检索，
@@ -46,7 +75,7 @@ generated/batch_001/
 # 入库：参数可以是批量目录（自动展开其中的场景子目录），也可以是单个场景目录
 python -m scenario_cases library add ./generated/batch_001 --db ./library.db
 
-# 检索：所有含急刹的场景
+# 检索：所有含急刹的场景（--profile 逗号分隔可多选）
 python -m scenario_cases library list --profile hard_brake --db ./library.db
 
 # 检索：减速度 ≥ 4 m/s² 的场景，JSON 输出便于脚本消费
@@ -61,17 +90,17 @@ python -m scenario_cases library show scn_000 --db ./library.db
 python -m scenario_cases library stats --db ./library.db
 ```
 
-设计取舍：单文件 SQLite = 零依赖、一个文件拷走就是整个库（不上 Postgres/MySQL 的理由：
-单机单人工具、要能一键拷走）；文件内容随元数据入库 = 源目录删了也能原样导出；
-常用检索轴（profile / v0 / decel / duration / at）建成列，完整参数另存 JSON，范围查询走列、信息不丢。
-
-## 回归集（suite）：把一次挑选固化成"同一套卷子"
+### 回归集（suite）：把一次挑选固化成"同一套卷子"
 
 评测要可比，两次跑的必须是同一批场景。`suite` 把一次查询结果固化为命名快照：
 
 ```shell
 # 按查询条件创建（条件与 library list 相同）
 python -m scenario_cases suite add brake-v1 --profile hard_brake --db ./library.db
+
+# 一次选出整个对抗组
+python -m scenario_cases suite add adversarial \
+    --profile sub_threshold,short_dip,v_dip,jitter,double_dip --db ./library.db
 
 # 列出、查看、导出
 python -m scenario_cases suite list --db ./library.db
@@ -81,46 +110,24 @@ python -m scenario_cases suite export brake-v1 ./regression/brake-v1 --db ./libr
 
 导出的目录每个场景一个子目录（字节级一致），顶层一份 `manifest.json`：
 suite 元信息、逐场景真值事件与参数、内容指纹——下游拿 manifest 即可对答案，
-不必解析每份 truth.json。
+不必解析每份 `truth.json`。
 
 **关键取舍：suite 存成员快照，不只存查询条件。** 只存条件的话，库里每新增一条
 场景，回归集成员就悄悄变了——两次评测跑的其实不是同一套卷子，指标不可比。
 查询条件只作为 provenance 记录在案（"这个集当初是怎么挑的"）。
 
-造数据、读指标的方法论沉淀在 [docs/EVAL_CHECKLIST.md](docs/EVAL_CHECKLIST.md)：
-真值怎么避免循环论证、对抗样本参数怎么反推、双层指标怎么分开读。
-
-## 场景模板
-
-| 模板 | 行为 | 真值事件（口径参考实现算出） |
-|---|---|---|
-| `cruise` | 匀速，无制动 | 无（负样本） |
-| `mild_decel` | 轻减速（默认 2.5 m/s²，1 秒） | 有，边界比制动窗各多探 0.1 秒 |
-| `hard_brake` | 急刹（默认 4 m/s²，3 秒） | 有，同上 |
-| `lead_cut_in` | 前车切入 + 制动，目标额外接近 | 有，同上 |
-| `sub_threshold` | **对抗**：亚门槛平台（1.4–1.9 m/s² 持续 2–5 秒） | 无——任意 0.5 秒窗口降幅 < 1.0 |
-| `short_dip` | **对抗**：短急减 0.2–0.3 秒（仅 2–3 个下降间隔）后恢复 | 无——不够"持续" |
-| `v_dip` | **对抗**：V 形急减 0.4 秒（4 个下降间隔）后恢复 | 有——`[at-0.1, at+dip]`，左边界比急减起点早 0.1 秒（窗口语义） |
-| `jitter` | **对抗**：三角抖动（±0.3–0.6 m/s，周期 0.6–1.0 秒） | 无——大幅抖动贴近宽筛门槛时会产生筛查候选 |
-| `double_dip` | **对抗**：双波段急减，间隔 0.2–0.8 秒匀速 | 间隔 0.2 秒合并为一个；≥0.3 秒保持两个（间隔内速度持平，不满足搭桥降幅） |
-
-典型组的减速度下限 2.2 m/s²，保证 0.5 秒窗口降幅 ≥ 1.0 m/s，跨过 SD-WINDOW-1.1 门槛；
-对抗组专门打口径的边边角角，参数范围按"结论必须成立"反推（如短急减的 dip 上限 0.34 秒，
-取整到网格后最多 3 个下降间隔）。`--rows` 控制采样点数（0.1 秒网格，默认 601 ≈ 60 秒）。
-
-## 闭环回归（与 case-analyzer 对答案）
+### 闭环回归（与 case-analyzer 对答案）
 
 一条命令跑完：生成场景 → 导入 case-analyzer → 规则筛选 → 与真值对比 → 检出率/误报率报告。
 不需要 API Key、不需要人工标注，相同 `--seed` 完全可复现。
 
 ```shell
-# 需要 case-analyzer 的运行环境（pandas/numpy 是其依赖）
-# 用它的虚拟环境跑；源码位置默认取同级目录，也可用 --analyzer 或 CASE_ANALYZER_ROOT 指定
-../case-analyzer-oss/.venv/Scripts/python.exe -m scenario_cases regress \
-    --count 60 --seed 20261019 --out ./regression_run
+# 用 case-analyzer 的 Python 环境运行（它带 pandas/numpy）；
+# 源码位置默认取同级目录，也可用 --analyzer 或 CASE_ANALYZER_ROOT 指定
+python -m scenario_cases regress --count 60 --seed 20261019 --out ./regression_run
 ```
 
-### 真值为什么不算循环论证
+#### 真值为什么不算循环论证
 
 早期版本的真值是"注入了什么制动窗"——那和被评测工具共享同一套假设：
 工具按同一口径检出了注入的事件，100% 只证明两边代码没写岔，不证明任何事。
@@ -128,7 +135,7 @@ suite 元信息、逐场景真值事件与参数、内容指纹——下游拿 m
 SD-WINDOW-1.1 计算器——从生成的车辆 CSV 现场算出。两个独立实现一致才算检出；
 回归还会把"参考实现的事件集 vs 工具自带口径参考区间"逐条比对，不一致就报出来。
 
-### 两层口径，两层指标
+#### 两层口径，两层指标
 
 case-analyzer 的有意设计：候选筛查门槛（0.6 m/s 降幅、3 个下降间隔、0.2 m/s 回升）
 比事件口径（1.0 m/s、4 个间隔、0.1 m/s）宽——**宽筛为了不漏，噪声留给复核层**。
@@ -160,7 +167,7 @@ case-analyzer 的有意设计：候选筛查门槛（0.6 m/s 降幅、3 个下�
 `--out` 目录下留存 `regression_report.json`（逐案例明细：漏检事件、误报候选及判定、
 分模板统计、贴边界样本、实现不一致清单），默认临时目录跑完即清，`--keep` 可留现场排查。
 
-### 已知边界（重要，勿过度解读数字）
+#### 已知边界（重要，勿过度解读数字）
 
 - 100% 检出率是**可证明的**（宽筛门槛严格更松，协议事件必被候选覆盖），不是巧合；
   本轮的价值在于两个独立实现在 60 条对抗样本上逐条一致。
@@ -168,6 +175,52 @@ case-analyzer 的有意设计：候选筛查门槛（0.6 m/s 降幅、3 个下�
   真实数据的噪声结构（传感器误差、采样抖动、合法驾驶行为）不在生成能力内。
 - 参考实现是照抄口径常量的第二份实现，不是第三方标准实现；它和工具一致，证明的是
   "双方对口径的理解一致"，不是"口径本身正确"。
+
+## 场景模板
+
+| 模板 | 行为 | 真值事件（口径参考实现算出） |
+|---|---|---|
+| `cruise` | 匀速，无制动 | 无（负样本） |
+| `mild_decel` | 轻减速（默认 2.5 m/s²，1 秒） | 有，边界比制动窗各多探 0.1 秒 |
+| `hard_brake` | 急刹（默认 4 m/s²，3 秒） | 有，同上 |
+| `lead_cut_in` | 前车切入 + 制动，目标额外接近 | 有，同上 |
+| `sub_threshold` | **对抗**：亚门槛平台（1.4–1.9 m/s² 持续 2–5 秒） | 无——任意 0.5 秒窗口降幅 < 1.0 |
+| `short_dip` | **对抗**：短急减 0.2–0.3 秒（仅 2–3 个下降间隔）后恢复 | 无——不够"持续" |
+| `v_dip` | **对抗**：V 形急减 0.4 秒（4 个下降间隔）后恢复 | 有——`[at-0.1, at+dip]`，左边界比急减起点早 0.1 秒（窗口语义） |
+| `jitter` | **对抗**：三角抖动（±0.3–0.6 m/s，周期 0.6–1.0 秒） | 无——大幅抖动贴近宽筛门槛时会产生筛查候选 |
+| `double_dip` | **对抗**：双波段急减，间隔 0.2–0.8 秒匀速 | 间隔 0.2 秒合并为一个；≥0.3 秒保持两个（间隔内速度持平，不满足搭桥降幅） |
+
+典型组的减速度下限 2.2 m/s²，保证 0.5 秒窗口降幅 ≥ 1.0 m/s，跨过 SD-WINDOW-1.1 门槛；
+对抗组专门打口径的边边角角，参数范围按"结论必须成立"反推（如短急减的 dip 上限 0.34 秒，
+取整到网格后最多 3 个下降间隔——再大样本就悄悄变成另一类，结论泄露）。
+`--rows` 控制采样点数（0.1 秒网格，默认 601 ≈ 60 秒）。
+
+造数据、读指标的方法论沉淀在 [docs/EVAL_CHECKLIST.md](docs/EVAL_CHECKLIST.md)：
+真值怎么避免循环论证、对抗样本参数怎么反推、双层指标怎么分开读。
+
+## 项目结构
+
+```text
+scenario-cases/
+├── scenario_cases/
+│   ├── templates.py    # 9 个模板的速度曲线定义、参数范围与联合约束
+│   ├── generator.py    # 规格 → 四路 CSV + truth.json + source.json
+│   ├── protocol.py     # SD-WINDOW-1.1 口径的独立参考实现（真值来源）
+│   ├── store.py        # SQLite 场景库：入库/检索/导出 + 回归集快照
+│   ├── regress.py      # 闭环回归：调用 case-analyzer → 双层指标
+│   └── cli.py          # 命令行入口
+├── tests/              # 123 个单元/集成测试
+└── docs/
+    └── EVAL_CHECKLIST.md  # 评测方法论 checklist
+```
+
+## 设计取舍
+
+- **单文件 SQLite**：零依赖、一个文件拷走就是整个库。不上 Postgres/MySQL 的理由：单机单人工具、要能一键拷走。
+- **文件内容随元数据入库**：源目录删了也能原样导出。
+- **常用检索轴建成列**（profile / v0 / decel / duration / at），完整参数另存 JSON：范围查询走列、信息不丢。
+- **suite 存成员快照**：回归集定义不受库新增影响，指标可比；查询条件只作 provenance。
+- **对抗参数按结论反推**：先定"这条样本必须得出什么结论"，再反推参数范围；时间参数对齐 0.1 秒采样网格，取整不允许把样本推进另一类。
 
 ## 测试
 
@@ -182,17 +235,21 @@ python -B -m unittest discover -s tests -v
 闭环指标（覆盖合并、双层判定、结构差异、analyzer 定位）。闭环回归的真跑用例需要
 case-analyzer 源码及其 pandas/numpy 环境，缺失时自动跳过（不报错）。
 
-## 路线图（按周推进，范围只缩不扩）
+## Roadmap
 
-- [x] W1–W2：场景模板与生成器（四路 CSV + 真值 + 来源声明 + 测试）
-- [x] W3：场景库入库（SQLite 单文件、sha256 指纹去重、按参数检索、原样导出）
-- [x] W4：闭环回归（生成 → 调用 case-analyzer 全跑 → 对真值 → 检出率/误报率报告）
-- [x] W5：口径参考实现 + 对抗样本（真值不再循环论证；双层指标；实现一致性比对）
-- [x] W6：回归集导出（suite 快照 + manifest）+ 评测 checklist 沉淀
-  （[docs/EVAL_CHECKLIST.md](docs/EVAL_CHECKLIST.md)）
+已实现：场景生成器、场景库、回归集、闭环回归、口径参考实现与对抗样本。
 
-明确不做：物理引擎、传感器建模、3D 渲染、CARLA/SUMO 集成、强化学习。
+可能的方向（不承诺排期）：更多对抗形状、适配其他分析工具、CI 流水线。
+欢迎通过 Issue / PR 交流。
+
+**非目标**：物理引擎、传感器建模、3D 渲染、CARLA/SUMO 集成、强化学习——
+本项目刻意停在运动学级，把"带标准答案的测试数据"这一件事做透。
+
+## 相关项目
+
+- [case-analyzer](https://github.com/iceicythe/case-analyzer) —— 本项目的被评测对象：
+  智驾测试 Case 分析助手（减速事件检测 + AI 归因 + 飞书通知）
 
 ## License
 
-MIT。
+[MIT](LICENSE)
