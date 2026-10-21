@@ -1,0 +1,21 @@
+{
+  "case_id": "seg_024",
+  "completed": true,
+  "decision": "uncertain",
+  "events": [],
+  "events_relative": [],
+  "t0_seconds": 39848.0,
+  "expected_candidate_verdict": "none",
+  "expected_observation_status": [],
+  "label_origin": "human_verified",
+  "derived_by": "verify.py 从四路 CSV 独立重算（构造真值）；2026-10-15 孙佳鑫逐段人工复核确认/修正后生效",
+  "scene": "事件内部 0.6 秒采样缺口",
+  "notes": "缺口覆盖全部完整窗口，无法确认事件。人工复核确认。",
+  "annotation": {
+    "annotator": "孙佳鑫",
+    "reviewed_at": "2026-10-15",
+    "method": "逐段对照车速曲线人工复核（human_review_worksheet.html），2026-10-15",
+    "base_truth": "constructive_truth（构造真值）经人工确认后生效；1 段按人工判定修正",
+    "review_record": "reference_labels/_human_review_2026-10-15.json"
+  }
+}

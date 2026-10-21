@@ -1,0 +1,35 @@
+{
+  "case_id": "seg_023",
+  "completed": true,
+  "decision": "positive",
+  "events": [
+    [
+      54735.2,
+      54743.2
+    ]
+  ],
+  "events_relative": [
+    [
+      8.0,
+      16.0
+    ]
+  ],
+  "t0_seconds": 54727.2,
+  "expected_candidate_verdict": "source_unverified",
+  "expected_observation_status": [
+    "planning_trigger_needs_review",
+    "planning_trigger_needs_review"
+  ],
+  "label_origin": "human_verified",
+  "derived_by": "verify.py 从四路 CSV 独立重算（构造真值）；2026-10-15 孙佳鑫逐段人工复核确认/修正后生效",
+  "scene": "事件中段存在 0.3 秒采样缺口",
+  "notes": "人工复核修正：原按缺口拆分为两个区间，人工判定为连续减速事件 8.0-16.0。",
+  "annotation": {
+    "human_correction": "原构造区间 8.0-13.7; 14.1-16.0（采样缺口按协议拆分），人工复核判定为连续减速事件 8.0-16.0",
+    "annotator": "孙佳鑫",
+    "reviewed_at": "2026-10-15",
+    "method": "逐段对照车速曲线人工复核（human_review_worksheet.html），2026-10-15",
+    "base_truth": "constructive_truth（构造真值）经人工确认后生效；1 段按人工判定修正",
+    "review_record": "reference_labels/_human_review_2026-10-15.json"
+  }
+}

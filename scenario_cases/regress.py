@@ -23,11 +23,24 @@ FP+TN，本工具没有负例单位，套用这个名字只会引起歧义）：
 - 候选级"误报候选占比"：无真值支撑的候选项 ÷ 总候选项。衡量复核工作量；
 - 簇级"误报簇占比"：无真值支撑的候选簇 ÷ 总候选簇。衡量事件质量——
   接力候选（两个候选接力盖住同一事件）在候选级会重复计数，簇级不会。
+
+两种输入模式：
+- 生成模式（默认）：现生成批次全自动跑，回答"工具对合成场景稳不稳"；
+- 固定案例模式（--cases/--labels）：对拍既有案例集（如冻结评测集的困难
+  案例），真值取外部人工标签，回答"工具对已知困难输入的行为是否符合预期"。
+  两种模式的报告带同样的元数据（代码版本、数据指纹、协议、阈值），数字可同表比较。
+
+报告元数据（回答"这批数字是什么时候、哪份代码、对哪份数据、按什么阈值跑的"）：
+- code_version：scenario-cases 与 case-analyzer 两个仓库的 git HEAD；
+- data_fingerprint：输入目录的内容哈希（生成模式对批次、固定模式对案例与标签）；
+- --check 时另存 gates 阈值快照与逐项结果。
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -37,12 +50,13 @@ from scenario_cases.cli import generate_batch
 from scenario_cases.generator import GENERATOR_VERSION
 from scenario_cases.protocol import PROTOCOL_ID
 
-VERSION = "closed-loop-regress-2.0"
+VERSION = "closed-loop-regress-2.1"
 COVERAGE_RULE = 0.9
 DEFAULT_COUNT = 20
 DEFAULT_ROWS = 601
 DEFAULT_SEED = 20261019
 SOURCE_NAME = "scenario-cases 闭环回归批次"
+SOURCE_NAME_FIXED = "scenario-cases 固定案例集对拍"
 ACCELERATION_SOURCE = "由车速有限差分得到，不是独立传感器测量"
 MEETS = "meets_numeric_rule"
 
@@ -246,6 +260,76 @@ def _load_analyzer_modules(analyzer_root: Path):
             DEFAULT_RUNTIME, WorkbenchContext, initialize)
 
 
+def _git_head(path) -> str | None:
+    """取目录所在 git 仓库的当前 commit；不在仓库里或没有 git 时返回 None。
+
+    报告要能回答“这批数字是哪份代码跑出来的”，所以代码版本进元数据；
+    但发布包/解压目录里没有 .git，不能因此让回归跑不起来。
+    """
+    try:
+        proc = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                              capture_output=True, text=True, timeout=10)
+        return proc.stdout.strip() if proc.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _data_fingerprint(root) -> str | None:
+    """目录内容指纹：所有文件（相对路径排序）的 SHA256 拼接后再取短哈希。
+
+    回答“这批数字是对着哪份数据跑的”。文件很多时逐字节读取有成本，
+    但回归批次最多几百个 CSV、单文件几百 KB，可接受。
+    """
+    root = Path(root)
+    if not root.is_dir():
+        return None
+    digest = hashlib.sha256()
+    count = 0
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(hashlib.sha256(path.read_bytes()).hexdigest().encode("ascii"))
+        count += 1
+    return f"sha256:{digest.hexdigest()[:16]}:{count}files" if count else None
+
+
+def _import_and_score(batch, *, modules, source_type, source_name, context,
+                      coverage_rule, truth_events=None):
+    """闭环流水线的公共部分：导入批次 → 读回候选与参考区间 → 评分。
+
+    生成模式与固定案例模式共用；truth_events 为 None 时从批次的
+    truth.json 读真值，固定模式则由调用方从外部标签目录提供。
+    modules 是 _load_analyzer_modules 返回三元组的前三项。
+    """
+    build_candidate_case, build_annotation_assist, run_import = modules
+    summary = run_import(batch, context, source_type, source_name, ACCELERATION_SOURCE)
+    imported_ids = [item["case_id"] for item in summary["cases"]
+                    if item["status"] == "imported"]
+    import_failures = [{"case_id": item["case_id"], "status": item["status"],
+                        "message": item["message"]}
+                       for item in summary["cases"] if item["status"] != "imported"]
+    cases = {}
+    for case_id in imported_ids:
+        if truth_events is None:
+            truth = json.loads((batch / case_id / "truth.json").read_text(encoding="utf-8"))
+            events, profile, notes = truth["events"], truth["spec"]["profile"], truth.get("notes", [])
+        else:
+            events = truth_events[case_id]["events"]
+            profile = truth_events[case_id].get("profile", "external")
+            notes = truth_events[case_id].get("notes", [])
+        built = build_candidate_case(context.data_root / case_id)
+        assist = build_annotation_assist(context.data_root / case_id)
+        cases[case_id] = {"profile": profile,
+                          "truth_events": events, "notes": notes,
+                          "candidates": [{"candidate_id": candidate["candidate_id"],
+                                          "start_time": candidate["start_time"],
+                                          "end_time": candidate["end_time"],
+                                          "event_assessment": candidate["event_assessment"]}
+                                         for candidate in built["candidates"]],
+                          "tool_reference_events": [[event["start_time"], event["end_time"]]
+                                                    for event in assist["reference_events"]]}
+    return cases, summary, import_failures
+
+
 def run_regression(*, count: int = DEFAULT_COUNT, seed: int = DEFAULT_SEED,
                    rows: int = DEFAULT_ROWS, out=None, analyzer=None,
                    keep: bool = False, coverage_rule: float = COVERAGE_RULE) -> dict:
@@ -270,28 +354,15 @@ def run_regression(*, count: int = DEFAULT_COUNT, seed: int = DEFAULT_SEED,
                                    evaluation_output=runtime / "evaluations",
                                    model_reviews_root=runtime / "model_reviews",
                                    automatic_review=False)
-        summary = run_import(batch, context, "synthetic", SOURCE_NAME, ACCELERATION_SOURCE)
-        imported_ids = [item["case_id"] for item in summary["cases"]
-                        if item["status"] == "imported"]
-        import_failures = [{"case_id": item["case_id"], "status": item["status"],
-                            "message": item["message"]}
-                           for item in summary["cases"] if item["status"] != "imported"]
-        cases = {}
-        for case_id in imported_ids:
-            truth = json.loads((batch / case_id / "truth.json").read_text(encoding="utf-8"))
-            built = build_candidate_case(context.data_root / case_id)
-            assist = build_annotation_assist(context.data_root / case_id)
-            cases[case_id] = {"profile": truth["spec"]["profile"],
-                              "truth_events": truth["events"], "notes": truth.get("notes", []),
-                              "candidates": [{"candidate_id": candidate["candidate_id"],
-                                              "start_time": candidate["start_time"],
-                                              "end_time": candidate["end_time"],
-                                              "event_assessment": candidate["event_assessment"]}
-                                             for candidate in built["candidates"]],
-                              "tool_reference_events": [[event["start_time"], event["end_time"]]
-                                                        for event in assist["reference_events"]]}
+        cases, summary, import_failures = _import_and_score(
+            batch, modules=(build_candidate_case, build_annotation_assist, run_import),
+            source_type="synthetic", source_name=SOURCE_NAME,
+            context=context, coverage_rule=coverage_rule)
         report = {"tool": VERSION, "started_at": started,
                   "generator": GENERATOR_VERSION, "analyzer_root": str(analyzer_root),
+                  "code_version": {"scenario_cases": _git_head(Path(__file__).resolve().parents[1]),
+                                   "case_analyzer": _git_head(analyzer_root)},
+                  "data_fingerprint": _data_fingerprint(batch),
                   "seed": seed, "count": count, "rows_per_case": rows,
                   "protocol": PROTOCOL_ID,
                   "truth_basis": (f"{PROTOCOL_ID} 参考实现从生成数据计算"
@@ -310,6 +381,93 @@ def run_regression(*, count: int = DEFAULT_COUNT, seed: int = DEFAULT_SEED,
         if not keep and not out:
             # 临时目录连同 runtime 一起清掉；报告已成型，需要留存现场就用
             # --keep 或 --out。路径一并置空，避免摘要指向已删除的文件。
+            import shutil
+            shutil.rmtree(workspace, ignore_errors=True)
+
+
+def load_fixed_truth(cases_dir, labels_dir) -> dict:
+    """固定案例模式读外部标签：labels_dir/<case_id>.json 的 events 字段。
+
+    兼容两种标签布局：reference_labels 风格（events 为 [start,end] 列表）
+    与 truth.json 风格（events 为 {"start","end","kind"} dict 列表）。
+    decision=uncertain 的标签按无事件处理，并在 notes 里保留原因。
+    """
+    labels = {}
+    for path in sorted(Path(labels_dir).glob("*.json")):
+        label = json.loads(path.read_text(encoding="utf-8"))
+        case_id = label.get("case_id") or path.stem
+        events = []
+        for item in label.get("events") or []:
+            if isinstance(item, dict):
+                events.append({"start": float(item["start"]), "end": float(item["end"]),
+                               "kind": item.get("kind", "deceleration")})
+            else:
+                events.append({"start": float(item[0]), "end": float(item[1]),
+                               "kind": "deceleration"})
+        if label.get("decision") == "uncertain" and not events:
+            # 人工结论"无法判断"：不计事件真值，但保留场景说明供报告引用
+            events = []
+        labels[case_id] = {"events": events, "profile": label.get("scene", "external"),
+                           "notes": [n for n in [label.get("notes"), label.get("scene")] if n]}
+    return labels
+
+
+def run_fixed_regression(cases_dir, labels_dir, *, out=None, analyzer=None,
+                         keep: bool = False, coverage_rule: float = COVERAGE_RULE) -> dict:
+    """对拍固定案例集（困难案例/冻结集复用）：不现生成，直接导入给定目录。
+
+    与 run_regression 的差别只在输入来源：真值来自 labels_dir 的人工标签，
+    场景数据来自 cases_dir。报告同样带代码版本、数据指纹与全部口径字段，
+    保证两种模式的数字可以放在同一张表里比较。
+    """
+    cases_dir, labels_dir = Path(cases_dir), Path(labels_dir)
+    if not cases_dir.is_dir() or not labels_dir.is_dir():
+        raise ValueError(f"固定案例模式需要 cases 与 labels 两个目录：{cases_dir} / {labels_dir}")
+    analyzer_root = locate_analyzer(analyzer)
+    (build_candidate_case, build_annotation_assist, run_import,
+     DEFAULT_RUNTIME, WorkbenchContext, initialize) = _load_analyzer_modules(analyzer_root)
+
+    truth = load_fixed_truth(cases_dir, labels_dir)
+    started = datetime.now(timezone.utc).isoformat()
+    workspace = Path(out) if out else Path(tempfile.mkdtemp(prefix="scenario-regress-fixed-"))
+    workspace.mkdir(parents=True, exist_ok=True)
+    report = None
+    runtime = workspace / "runtime"
+    try:
+        initialize(runtime)
+        context = WorkbenchContext(batch_dir=runtime / "index", data_root=runtime / "data",
+                                   annotations_root=runtime / "annotations",
+                                   evaluation_output=runtime / "evaluations",
+                                   model_reviews_root=runtime / "model_reviews",
+                                   automatic_review=False)
+        cases, summary, import_failures = _import_and_score(
+            cases_dir, modules=(build_candidate_case, build_annotation_assist, run_import),
+            source_type="synthetic", source_name=SOURCE_NAME_FIXED,
+            context=context, coverage_rule=coverage_rule, truth_events=truth)
+        report = {"tool": VERSION, "started_at": started,
+                  "generator": GENERATOR_VERSION, "analyzer_root": str(analyzer_root),
+                  "code_version": {"scenario_cases": _git_head(Path(__file__).resolve().parents[1]),
+                                   "case_analyzer": _git_head(analyzer_root)},
+                  "data_fingerprint": {"cases": _data_fingerprint(cases_dir),
+                                       "labels": _data_fingerprint(labels_dir)},
+                  "mode": "fixed-cases",
+                  "cases_dir": str(cases_dir), "labels_dir": str(labels_dir),
+                  "protocol": PROTOCOL_ID,
+                  "truth_basis": (f"外部人工标签（{labels_dir}）；"
+                                  f"{PROTOCOL_ID} 口径仅用于候选与参考区间比对"),
+                  "source": {"type": "synthetic", "name": SOURCE_NAME_FIXED,
+                             "note": "固定案例集对拍：数据来自既有冻结批次，"
+                                     "不是道路采集或闭环仿真"},
+                  "import": summary["totals"], "import_failures": import_failures,
+                  "metrics": score_cases(cases, coverage_rule),
+                  "agreement": _agreement(cases), "cases": cases}
+        report_path = workspace / "regression_report.json"
+        report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+                               encoding="utf-8")
+        report["report_path"] = str(report_path)
+        return report
+    finally:
+        if not keep and not out:
             import shutil
             shutil.rmtree(workspace, ignore_errors=True)
             report["report_path"] = None
@@ -392,7 +550,8 @@ def _rate(numerator, denominator):
 # --check 门禁的默认阈值。宽筛层噪声有固有成本（评审原话：不宜要求零误报），
 # 所以噪声只设容忍上限；口径误判和实现不一致是实现 bug，默认必须为 0/100%。
 DEFAULT_GATES = {"max_import_failures": 0, "max_misjudged": 0, "min_agreement": 1.0,
-                 "max_missed": 0, "max_noise_candidates": 0.25,
+                 "max_missed": 0, "max_confirmed_missed": 0,
+                 "max_noise_candidates": 0.25,
                  "max_structural_mismatch": 0}
 
 
@@ -401,12 +560,18 @@ def check_report(report: dict, gates: dict | None = None) -> dict:
 
     设计成纯函数：CI 与本地共用同一判定，测试可以直接喂报告进来自动判别。
     噪声占比无定义（整批零候选）时不算未过——那种情况由漏检门禁兜底。
+    “漏检事件”与“确认漏检”是两个层次：前者看候选是否覆盖真值，后者看
+    确认区间是否覆盖真值。候选正常而确认退化时只有后者非零。
     """
     limits = {**DEFAULT_GATES, **(gates or {})}
     totals = report["metrics"]["totals"]
     agreement = report.get("agreement") or {}
     noise = totals.get("false_positive_candidate_ratio")
     missed = totals["truth_events"] - totals["detected_events"]
+    # 确认层漏检：真值事件被候选覆盖、却没有被确认区间覆盖的数目。
+    # 与“漏检事件”分开设门禁——候选覆盖正常但确认能力退化（区间收紧、
+    # 匹配规则变严）时，漏检门禁全绿而确认率暗跌，必须单独拦。
+    confirmed_missed = totals["truth_events"] - totals["confirmed_events"]
 
     def gate(name, ok, actual, limit, message):
         return {"gate": name, "ok": bool(ok), "actual": actual, "limit": limit,
@@ -425,6 +590,10 @@ def check_report(report: dict, gates: dict | None = None) -> dict:
              f"{agreement.get('cases', 0)}"),
         gate("漏检事件", missed <= limits["max_missed"], missed, limits["max_missed"],
              f"漏检真值事件 {missed} 个"),
+        gate("确认漏检", confirmed_missed <= limits["max_confirmed_missed"],
+             confirmed_missed, limits["max_confirmed_missed"],
+             f"被候选覆盖但未被确认区间覆盖的真值事件 {confirmed_missed} 个"
+             f"（候选正常而确认能力退化时此项才暴露）"),
         gate("宽筛噪声", noise is None or noise <= limits["max_noise_candidates"],
              noise, limits["max_noise_candidates"],
              f"误报候选占比 {_percent(noise)}"),

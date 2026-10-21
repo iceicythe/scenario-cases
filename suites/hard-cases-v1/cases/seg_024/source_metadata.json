@@ -1,0 +1,17 @@
+{
+  "schema": "case-import-1.0",
+  "case_id": "seg_024",
+  "source_type": "synthetic",
+  "source_name": "sim-batch-02 场景脚本合成日志",
+  "dataset": "normalized-csv",
+  "imported_at": "2026-10-15T04:41:26.918181+00:00",
+  "source_claim_verified": false,
+  "conversion": {
+    "acceleration_source": "由车速相邻点后向差分派生；非独立传感器测量"
+  },
+  "signal_sources": {
+    "vehicle_state.csv": {
+      "acceleration_mps2": "由车速相邻点后向差分派生；非独立传感器测量"
+    }
+  }
+}

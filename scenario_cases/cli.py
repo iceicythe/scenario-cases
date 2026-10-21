@@ -42,6 +42,8 @@ def batch_tag(seed: int, rows: int, mix: dict | None = None, tag: str | None = N
     （同 ID 不同内容 → 入库失败），场景库没法跨批次持续积累。
     同一种子 + 行数 + 模板配比 → 同一标签（可复现，重复入库靠内容指纹去重）；
     任何一项不同 → 不同标签（两批互不撞 ID，可同时入库）。
+    配比按名字排序后计入哈希，生成器版本也计入：修复抽样顺序这类
+    “同配置不同内容”的问题时升 minor 版本，新旧批次自动换命名空间。
     刻意不含 count：条数不改变单条场景的内容，多生成几条应与少生成几条
     共用命名空间，让指纹去重去识别重复，而不是换一批新 ID。
     """
@@ -53,14 +55,17 @@ def batch_tag(seed: int, rows: int, mix: dict | None = None, tag: str | None = N
 
 
 def pick_profile(rng: random.Random, mix: dict | None = None) -> str:
+    # 必须按名字排序遍历：batch_tag 的哈希口径就是 sorted(mix)，这里若按
+    # dict 原序遍历（--profiles 的书写顺序），同配比不同写法会算出同一 tag
+    # 却抽出不同模板序列——同 ID 不同内容，入库必撞。两处口径保持一致。
     weights = MIX if mix is None else mix
     roll = rng.random()
     cumulative = 0.0
-    for name, weight in weights.items():
+    for name, weight in sorted(weights.items()):
         cumulative += weight
         if roll <= cumulative:
             return name
-    return list(weights)[-1]  # 权重和为 1 时不会走到；兜底返回最后一个
+    return sorted(weights)[-1]  # 权重和为 1 时不会走到；兜底返回排序最后一个
 
 
 def jitter(rng: random.Random, profile: str) -> dict:
@@ -179,9 +184,15 @@ def build_parser() -> argparse.ArgumentParser:
     suite_export.add_argument("--db", type=Path, default=DEFAULT_DB)
 
     regress = sub.add_parser("regress", help="闭环回归：生成 → case-analyzer 全跑 → 对真值 → 检出率/误报率")
-    regress.add_argument("--count", type=int, default=20, help="场景条数，默认 20")
-    regress.add_argument("--seed", type=int, default=20261019, help="随机种子，可复现")
+    regress.add_argument("--count", type=int, default=None, help="场景条数，默认 20")
+    regress.add_argument("--seed", type=int, default=None, help="随机种子，可复现，默认 20261019")
     regress.add_argument("--rows", type=int, default=601, help="每条采样点数，默认 601")
+    regress.add_argument("--cases", type=Path, default=None,
+                         help="固定案例模式：场景目录（每个子目录是一例，四路 CSV）。"
+                              "与 --labels 同时提供，不再现生成")
+    regress.add_argument("--labels", type=Path, default=None,
+                         help="固定案例模式：外部标签目录（<case_id>.json，events 字段）。"
+                              "与 --cases 同时提供")
     regress.add_argument("--out", type=Path, default=None,
                          help="工作目录（场景、runtime、报告）；默认临时目录，跑完即清")
     regress.add_argument("--keep", action="store_true", help="保留默认临时目录中的现场")
@@ -190,13 +201,18 @@ def build_parser() -> argparse.ArgumentParser:
     regress.add_argument("--coverage-rule", type=float, default=0.9,
                          help="真值事件被判检出的候选覆盖阈值，默认 0.9")
     regress.add_argument("--check", action="store_true",
-                         help="门禁模式：导入失败/口径误判/实现不一致/漏检/噪声占比/结构不一致"
-                              "任一未过即返回非零退出码（供 CI 或本地发布前拦截）")
+                         help="门禁模式：导入失败/口径误判/实现不一致/漏检/确认漏检/"
+                              "噪声占比/结构不一致任一未过即返回非零退出码"
+                              "（供 CI 或本地发布前拦截）")
     regress.add_argument("--max-noise-candidates", type=float, default=0.25,
                          help="--check 的误报候选占比容忍上限，默认 0.25"
                               "（宽筛固有噪声，不要求零）")
     regress.add_argument("--max-missed", type=int, default=0,
-                         help="--check 允许的漏检真值事件数，默认 0")
+                         help="--check 允许的漏检真值事件数（候选层），默认 0")
+    regress.add_argument("--max-confirmed-missed", type=int, default=0,
+                         help="--check 允许的确认漏检数：被候选覆盖但确认区间未覆盖的"
+                              "真值事件（确认层），默认 0。候选正常而确认能力退化时"
+                              "只有此项能暴露")
     regress.add_argument("--max-misjudged", type=int, default=0,
                          help="--check 允许的口径误判候选数，默认 0（这是实现 bug，应为 0）")
     regress.add_argument("--min-agreement", type=float, default=1.0,
@@ -222,13 +238,37 @@ def main(argv=None) -> int:
 
 
 def _run_regress(args) -> int:
-    # 延迟导入：regress 依赖 case-analyzer 环境，generate/library 不依赖
-    from scenario_cases.regress import check_report, format_gates, format_report, run_regression
+    # 延迟导入：regress 依赖 case-analyzer 环境，且它反向依赖本模块的
+    # generate_batch，顶层导入会形成循环
+    from scenario_cases.regress import (DEFAULT_COUNT, DEFAULT_SEED, check_report,
+                                        format_gates, format_report,
+                                        run_fixed_regression, run_regression)
+
+    fixed = bool(args.cases) or bool(args.labels)
+    if fixed:
+        if not (args.cases and args.labels):
+            print("--cases 与 --labels 必须同时提供", file=sys.stderr)
+            return 2
+        if args.count is not None or args.seed is not None:
+            print("固定案例模式（--cases/--labels）不能与 --count/--seed 混用", file=sys.stderr)
+            return 2
+
+    if not fixed and ((args.count is not None and args.count < 1) or args.rows < 10):
+        print("count 至少 1，rows 至少 10", file=sys.stderr)
+        return 2
 
     try:
-        report = run_regression(count=args.count, seed=args.seed, rows=args.rows,
-                                out=args.out, analyzer=args.analyzer, keep=args.keep,
-                                coverage_rule=args.coverage_rule)
+        if fixed:
+            report = run_fixed_regression(args.cases, args.labels, out=args.out,
+                                          analyzer=args.analyzer, keep=args.keep,
+                                          coverage_rule=args.coverage_rule)
+        else:
+            report = run_regression(
+                count=args.count if args.count is not None else DEFAULT_COUNT,
+                seed=args.seed if args.seed is not None else DEFAULT_SEED,
+                rows=args.rows,
+                out=args.out, analyzer=args.analyzer, keep=args.keep,
+                coverage_rule=args.coverage_rule)
     except ValueError as error:
         print(f"回归未开始：{error}", file=sys.stderr)
         return 2
@@ -239,9 +279,22 @@ def _run_regress(args) -> int:
             "max_misjudged": args.max_misjudged,
             "min_agreement": args.min_agreement,
             "max_missed": args.max_missed,
+            "max_confirmed_missed": args.max_confirmed_missed,
             "max_noise_candidates": args.max_noise_candidates,
             "max_structural_mismatch": args.max_structural_mismatch})
         print(format_gates(result))
+        # 阈值快照与逐项结果回写报告文件：报告从此自带"按什么阈值判定、
+        # 判定结果如何"，脱离命令行也能读
+        report["gates"] = result["limits"]
+        report["check"] = {"passed": result["passed"],
+                           "gates": [{k: item[k] for k in ("gate", "ok", "actual", "limit")}
+                                     for item in result["gates"]]}
+        report_path = report.get("report_path")
+        if report_path:
+            import json as _json
+            from pathlib import Path as _Path
+            _Path(report_path).write_text(
+                _json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return 0 if result["passed"] else 1
     return 0
 
@@ -260,9 +313,11 @@ def _run_generate(args) -> int:
     allowed = [name for name in args.profiles.split(",") if name]
     # 子集配比在局部归一化，不碰全局 MIX——原地改全局会让同进程内
     # 后续批次混进上一次的模板（roll 的上界变成权重和，直接错位）。
+    # 归一化后按名字排序落库：让 mix 从构造起就有确定顺序，消费端
+    # （pick_profile、batch_tag）即使漏排序也不会因书写顺序分叉。
     weights = {name: MIX.get(name, 0.0) for name in allowed}
     total = sum(weights.values()) or 1.0
-    mix = {name: weight / total for name, weight in weights.items()}
+    mix = {name: weight / total for name, weight in sorted(weights.items())}
     namespace = batch_tag(args.seed, args.rows, mix, args.tag)
 
     files = generate_batch(args.out, args.count, args.rows, args.seed, mix, namespace)

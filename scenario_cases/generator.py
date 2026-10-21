@@ -15,7 +15,11 @@ from scenario_cases.models import Scenario, ScenarioSpec, TruthEvent
 from scenario_cases.protocol import PROTOCOL_ID, reference_events
 from scenario_cases.templates import GRID, design_notes, min_speed, resolve_params, speed_at
 
-GENERATOR_VERSION = "scenario-cases-0.2.0"
+# 0.2.1：pick_profile 改为按模板名排序遍历（与 batch_tag 的 sorted 口径对齐），
+# 修复同配比不同书写顺序抽出不同内容却共用同一命名空间的问题。
+# 版本号进批次哈希：升 minor 让新代码生成的批次换命名空间，不与 0.2.0
+# 历史批次撞 ID（历史批次内容指纹不变，仍可按原样识别去重）。
+GENERATOR_VERSION = "scenario-cases-0.2.1"
 
 VEHICLE_HEADERS = ["timestamp", "speed_mps", "acceleration_mps2", "brake"]
 OBJECT_HEADERS = ["timestamp", "object_id", "distance_m", "relative_speed_mps", "confidence"]

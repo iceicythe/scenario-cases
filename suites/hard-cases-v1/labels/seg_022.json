@@ -1,0 +1,33 @@
+{
+  "case_id": "seg_022",
+  "completed": true,
+  "decision": "positive",
+  "events": [
+    [
+      48093.2,
+      48096.2
+    ]
+  ],
+  "events_relative": [
+    [
+      10.0,
+      13.0
+    ]
+  ],
+  "t0_seconds": 48083.2,
+  "expected_candidate_verdict": "source_unverified",
+  "expected_observation_status": [
+    "planning_trigger_needs_review"
+  ],
+  "label_origin": "human_verified",
+  "derived_by": "verify.py 从四路 CSV 独立重算（构造真值）；2026-10-15 孙佳鑫逐段人工复核确认/修正后生效",
+  "scene": "事件后巡航段存在 0.3 秒采样缺口",
+  "notes": "缺口位于事件之后的巡航段。",
+  "annotation": {
+    "annotator": "孙佳鑫",
+    "reviewed_at": "2026-10-15",
+    "method": "逐段对照车速曲线人工复核（human_review_worksheet.html），2026-10-15",
+    "base_truth": "constructive_truth（构造真值）经人工确认后生效；1 段按人工判定修正",
+    "review_record": "reference_labels/_human_review_2026-10-15.json"
+  }
+}

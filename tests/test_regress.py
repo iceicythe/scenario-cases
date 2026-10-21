@@ -173,11 +173,13 @@ class CheckReportTest(unittest.TestCase):
     """--check 门禁：纯函数判定，每项单独可测。"""
 
     def _report(self, *, import_failures=0, misjudged=0, agreement_rate=1.0,
-                matching=2, cases=2, missed=0, noise=None, structural=0):
+                matching=2, cases=2, missed=0, confirmed_missed=0, noise=None,
+                structural=0):
         truth_events, detected = 2, 2 - missed
         return {"import_failures": [{"case_id": "s", "status": "failed", "message": "x"}] * import_failures,
                 "metrics": {"totals": {"truth_events": truth_events,
                                        "detected_events": detected,
+                                       "confirmed_events": truth_events - confirmed_missed,
                                        "misjudged_candidates": misjudged,
                                        "false_positive_candidate_ratio": noise,
                                        "structural_mismatch_cases": structural}},
@@ -187,7 +189,7 @@ class CheckReportTest(unittest.TestCase):
     def test_all_gates_pass(self):
         result = check_report(self._report())
         self.assertTrue(result["passed"])
-        self.assertEqual(len(result["gates"]), 6)
+        self.assertEqual(len(result["gates"]), 7)
 
     def test_import_failure_blocks(self):
         result = check_report(self._report(import_failures=1))
@@ -207,6 +209,26 @@ class CheckReportTest(unittest.TestCase):
         self.assertFalse(result["passed"])
         self.assertTrue(any(item["gate"] == "漏检事件" and not item["ok"]
                             for item in result["gates"]))
+
+    def test_confirmed_missed_blocks(self):
+        # 确认层漏检：被候选覆盖但确认区间没覆盖的真值事件
+        result = check_report(self._report(confirmed_missed=1))
+        self.assertFalse(result["passed"])
+        self.assertTrue(any(item["gate"] == "确认漏检" and not item["ok"]
+                            for item in result["gates"]))
+
+    def test_confirmed_missed_independent_of_candidate_missed(self):
+        # 评审场景：候选覆盖全正常（漏检 0），但确认能力退化——只有确认漏检项挂，
+        # 漏检事件项必须仍然通过，证明两层门禁互不遮盖
+        checked = check_report(self._report(confirmed_missed=1))
+        self.assertFalse(checked["passed"])
+        by_gate = {item["gate"]: item for item in checked["gates"]}
+        self.assertFalse(by_gate["确认漏检"]["ok"])
+        self.assertTrue(by_gate["漏检事件"]["ok"])
+
+    def test_confirmed_missed_limit_is_overridable(self):
+        self.assertTrue(check_report(self._report(confirmed_missed=2),
+                                     gates={"max_confirmed_missed": 2})["passed"])
 
     def test_noise_above_limit_blocks_but_none_passes(self):
         self.assertFalse(check_report(self._report(noise=0.3))["passed"])

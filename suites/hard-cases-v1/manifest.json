@@ -1,0 +1,51 @@
+{
+  "name": "hard-cases-v1",
+  "created": "2026-10-21",
+  "purpose": "把冻结评测集中未进入事件指标分母的困难案例固化为固定回归集：对拍工具在已知困难输入上的行为，任何行为退化都被门禁抓到。",
+  "source": {
+    "from": "case-analyzer-oss/eval/sim-batch-02/",
+    "note": "三例均为该冻结集 30 例中因车辆采样缺口未计事件精确率/召回率的案例；案例数据与人工复核生效标签（human_verified）逐字节拷贝",
+    "label_origin": "human_verified（2026-10-15 人工逐段复核，非盲标）"
+  },
+  "members": [
+    {
+      "case_id": "seg_022",
+      "scene": "事件后巡航段存在 0.3 秒采样缺口",
+      "human_decision": "positive",
+      "truth_events": 1,
+      "why_hard": "缺口在事件之后的巡航段：事件本身完整，但桥接核查会追溯到缺口，考察工具是否把'事件后数据缺口'与'事件本身不可判定'区分开",
+      "expected_behavior": "导入成功；事件被候选覆盖；候选判定与确认行为以基线报告为准"
+    },
+    {
+      "case_id": "seg_023",
+      "scene": "事件中段存在 0.3 秒采样缺口",
+      "human_decision": "positive",
+      "truth_events": 1,
+      "why_hard": "人机分歧案例：构造真值按协议把事件拆成两个区间，人工复核判定为连续减速事件（单区间）。工具口径参考区间同样被缺口拆开——这是已知的、记录在案的分歧，不是 bug",
+      "expected_behavior": "导入成功；候选判定 source_unverified（不过来源核查、不自动确认）；工具口径区间与人工标签不一致（2/3 一致率的主要来源）；阈值 min-agreement 0.6 / max-structural-mismatch 1 即为固化这一已知分歧而设"
+    },
+    {
+      "case_id": "seg_024",
+      "scene": "事件内部 0.6 秒采样缺口",
+      "human_decision": "uncertain",
+      "truth_events": 0,
+      "why_hard": "缺口覆盖全部完整窗口，无法确认事件。人工结论'无法判断'——考察工具是否宁可不报也不编造",
+      "expected_behavior": "导入成功；无候选、无事件结论；不计任何指标"
+    }
+  ],
+  "gates_baseline": {
+    "note": "2026-10-21 首次固定回归（closed-loop-regress-2.1 + scenario-cases-0.2.1 + case-analyzer c889940）的阈值快照。阈值不是'通过线'，是'已知行为包线'：跌破包线说明行为变了，需人工评估是改进还是退化",
+    "max_import_failures": 0,
+    "max_misjudged": 0,
+    "min_agreement": 0.6,
+    "max_missed": 0,
+    "max_confirmed_missed": 2,
+    "max_noise_candidates": 0.7,
+    "max_structural_mismatch": 1
+  },
+  "run": "cd scenario-cases && python -m scenario_cases regress --cases suites/hard-cases-v1/cases --labels suites/hard-cases-v1/labels --out <全新目录> --keep --check --max-import-failures 0 --max-misjudged 0 --min-agreement 0.6 --max-missed 0 --max-confirmed-missed 2 --max-noise-candidates 0.7 --max-structural-mismatch 1",
+  "constraints": [
+    "--out 必须是全新目录：runtime 已有同 ID 数据时导入判冲突，三例会全部失败（这是导入冲突保护，不是回归）",
+    "regress 依赖 case-analyzer 运行环境（pandas/numpy），需用 case-analyzer-oss/.venv 的解释器运行"
+  ]
+}
