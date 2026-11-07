@@ -49,8 +49,9 @@ from pathlib import Path
 from scenario_cases.cli import generate_batch
 from scenario_cases.generator import GENERATOR_VERSION
 from scenario_cases.protocol import PROTOCOL_ID
+from scenario_cases.fixed_suite import load_fixed_truth, load_manifest, check_behavior
 
-VERSION = "closed-loop-regress-2.1"
+VERSION = "closed-loop-regress-2.2"
 COVERAGE_RULE = 0.9
 DEFAULT_COUNT = 20
 DEFAULT_ROWS = 601
@@ -87,7 +88,8 @@ def locate_analyzer(explicit=None) -> Path:
         if (candidate / "app" / "cli_import.py").is_file():
             return candidate
         raise ValueError(
-            f"指定的 case-analyzer 目录无效：{candidate}（缺少 app/cli_import.py）")
+            f"指定的 case-analyzer 目录无效：{candidate}（缺少 app/cli_import.py）。"
+            f"请用 --analyzer 或环境变量 CASE_ANALYZER_ROOT 指定其源码目录")
     fallback = default_analyzer_root()
     if (fallback / "app" / "cli_import.py").is_file():
         return fallback
@@ -109,12 +111,18 @@ def _merge(intervals):
 
 
 def merged_coverage(event, intervals) -> float:
-    """事件区间被候选区间集覆盖的比例；先合并重叠候选再计算。"""
+    """事件区间被候选区间集覆盖的比例；先合并重叠候选再计算。
+
+    输入 event 是 [start,end]，intervals 是候选区间列表；输出 0～1。
+    边界处理：先丢掉零长度候选（end≤start 不参与覆盖），重叠候选先合并，
+    避免同一段时间被重复累计；事件本身零长度直接返回 0。
+    """
     start, end = float(event[0]), float(event[1])
     if end <= start:
         return 0.0
     covered = 0.0
     for cluster_start, cluster_end in _merge(intervals):
+        # 只累加事件与候选簇的真实交集长度；两簇因已合并不会重叠。
         overlap = min(end, cluster_end) - max(start, cluster_start)
         if overlap > 0:
             covered += overlap
@@ -127,7 +135,15 @@ def score_cases(cases: dict, coverage_rule: float = COVERAGE_RULE) -> dict:
     boundary = dict.fromkeys(COUNTER_KEYS, 0)
     totals = dict.fromkeys(COUNTER_KEYS, 0)
     per_case = []
+    quality_cases = []
     for case_id, case in cases.items():
+        if case.get("decision") == "uncertain":
+            quality_cases.append({"case_id": case_id, "decision": "uncertain",
+                                  "reason": "参考标签无法判断，不计事件检出、误报及区间一致性",
+                                  "candidate_assessments": [c["event_assessment"] for c in case["candidates"]],
+                                  "unexpected_numeric_confirmations": sum(
+                                      c["event_assessment"] == MEETS for c in case["candidates"])})
+            continue
         truth = [[event["start"], event["end"]] for event in case["truth_events"]]
         intervals = [[candidate["start_time"], candidate["end_time"]]
                      for candidate in case["candidates"]]
@@ -157,11 +173,15 @@ def score_cases(cases: dict, coverage_rule: float = COVERAGE_RULE) -> dict:
                                       if best < coverage_rule - 1e-9)
         false_positives = []
         for candidate in case["candidates"]:
+            # 找当前候选所属的簇：簇由 _merge 生成且候选端点必落在簇内。
+            # 1e-9 容差吸收浮点边界，避免“数学上相接、浮点上差 1e-16”时找不到簇。
             cluster_index = next(i for i, item in enumerate(clusters)
                                  if item[0] <= candidate["start_time"] + 1e-9
                                  and candidate["end_time"] <= item[1] + 1e-9)
             cluster = clusters[cluster_index]
             best = cluster_best[cluster_index]
+            # 误报按“簇没有主要覆盖任何真值事件”判定；候选本身只负责
+            # 标注它属于哪个簇、自带什么数值判定，供两个口径分别统计。
             if best < coverage_rule - 1e-9:
                 false_positives.append({"candidate_id": candidate.get("candidate_id"),
                                         "interval": [candidate["start_time"], candidate["end_time"]],
@@ -197,6 +217,8 @@ def score_cases(cases: dict, coverage_rule: float = COVERAGE_RULE) -> dict:
         return round(numerator / denominator, 4) if denominator else None
 
     return {"coverage_rule": coverage_rule,
+            "input_cases": len(cases), "excluded_uncertain_cases": len(quality_cases),
+            "quality_cases": quality_cases,
             "totals": dict(totals,
                            detection_rate=rate(totals["detected_events"], totals["truth_events"]),
                            confirmation_rate=rate(totals["confirmed_events"], totals["truth_events"]),
@@ -216,7 +238,11 @@ def score_cases(cases: dict, coverage_rule: float = COVERAGE_RULE) -> dict:
 def _agreement(cases: dict) -> dict:
     """参考实现（真值来源）与工具自带口径参考区间的一致性。"""
     matching, mismatches = 0, []
+    assessed = 0
     for case_id, case in cases.items():
+        if case.get("decision") == "uncertain":
+            continue
+        assessed += 1
         mine = sorted((event["start"], event["end"]) for event in case["truth_events"])
         tool = sorted((round(float(start), 3), round(float(end), 3))
                       for start, end in case.get("tool_reference_events", []))
@@ -228,8 +254,8 @@ def _agreement(cases: dict) -> dict:
         else:
             mismatches.append({"case_id": case_id, "profile": case["profile"],
                                "reference": mine, "tool": tool})
-    return {"cases": len(cases), "matching": matching,
-            "agreement_rate": round(matching / len(cases), 4) if cases else None,
+    return {"cases": assessed, "excluded_uncertain_cases": len(cases) - assessed, "matching": matching,
+            "agreement_rate": round(matching / assessed, 4) if assessed else None,
             "mismatches": mismatches}
 
 
@@ -319,6 +345,7 @@ def _import_and_score(batch, *, modules, source_type, source_name, context,
         built = build_candidate_case(context.data_root / case_id)
         assist = build_annotation_assist(context.data_root / case_id)
         cases[case_id] = {"profile": profile,
+                          "decision": truth_events[case_id]["decision"] if truth_events is not None else ("positive" if events else "negative"),
                           "truth_events": events, "notes": notes,
                           "candidates": [{"candidate_id": candidate["candidate_id"],
                                           "start_time": candidate["start_time"],
@@ -383,37 +410,12 @@ def run_regression(*, count: int = DEFAULT_COUNT, seed: int = DEFAULT_SEED,
             # --keep 或 --out。路径一并置空，避免摘要指向已删除的文件。
             import shutil
             shutil.rmtree(workspace, ignore_errors=True)
-
-
-def load_fixed_truth(cases_dir, labels_dir) -> dict:
-    """固定案例模式读外部标签：labels_dir/<case_id>.json 的 events 字段。
-
-    兼容两种标签布局：reference_labels 风格（events 为 [start,end] 列表）
-    与 truth.json 风格（events 为 {"start","end","kind"} dict 列表）。
-    decision=uncertain 的标签按无事件处理，并在 notes 里保留原因。
-    """
-    labels = {}
-    for path in sorted(Path(labels_dir).glob("*.json")):
-        label = json.loads(path.read_text(encoding="utf-8"))
-        case_id = label.get("case_id") or path.stem
-        events = []
-        for item in label.get("events") or []:
-            if isinstance(item, dict):
-                events.append({"start": float(item["start"]), "end": float(item["end"]),
-                               "kind": item.get("kind", "deceleration")})
-            else:
-                events.append({"start": float(item[0]), "end": float(item[1]),
-                               "kind": "deceleration"})
-        if label.get("decision") == "uncertain" and not events:
-            # 人工结论"无法判断"：不计事件真值，但保留场景说明供报告引用
-            events = []
-        labels[case_id] = {"events": events, "profile": label.get("scene", "external"),
-                           "notes": [n for n in [label.get("notes"), label.get("scene")] if n]}
-    return labels
+            if report is not None:
+                report["report_path"] = None
 
 
 def run_fixed_regression(cases_dir, labels_dir, *, out=None, analyzer=None,
-                         keep: bool = False, coverage_rule: float = COVERAGE_RULE) -> dict:
+                         keep: bool = False, coverage_rule: float = COVERAGE_RULE, manifest=None) -> dict:
     """对拍固定案例集（困难案例/冻结集复用）：不现生成，直接导入给定目录。
 
     与 run_regression 的差别只在输入来源：真值来自 labels_dir 的人工标签，
@@ -423,11 +425,16 @@ def run_fixed_regression(cases_dir, labels_dir, *, out=None, analyzer=None,
     cases_dir, labels_dir = Path(cases_dir), Path(labels_dir)
     if not cases_dir.is_dir() or not labels_dir.is_dir():
         raise ValueError(f"固定案例模式需要 cases 与 labels 两个目录：{cases_dir} / {labels_dir}")
+    truth = load_fixed_truth(cases_dir, labels_dir)
+    if manifest is None and cases_dir.resolve().parent == labels_dir.resolve().parent:
+        sibling = cases_dir.resolve().parent / "manifest.json"
+        if sibling.is_file():
+            manifest = sibling
+    expectations = load_manifest(manifest, truth) if manifest is not None else None
     analyzer_root = locate_analyzer(analyzer)
     (build_candidate_case, build_annotation_assist, run_import,
      DEFAULT_RUNTIME, WorkbenchContext, initialize) = _load_analyzer_modules(analyzer_root)
 
-    truth = load_fixed_truth(cases_dir, labels_dir)
     started = datetime.now(timezone.utc).isoformat()
     workspace = Path(out) if out else Path(tempfile.mkdtemp(prefix="scenario-regress-fixed-"))
     workspace.mkdir(parents=True, exist_ok=True)
@@ -449,8 +456,11 @@ def run_fixed_regression(cases_dir, labels_dir, *, out=None, analyzer=None,
                   "code_version": {"scenario_cases": _git_head(Path(__file__).resolve().parents[1]),
                                    "case_analyzer": _git_head(analyzer_root)},
                   "data_fingerprint": {"cases": _data_fingerprint(cases_dir),
-                                       "labels": _data_fingerprint(labels_dir)},
+                                       "labels": _data_fingerprint(labels_dir),
+                                       "manifest_sha256": hashlib.sha256(Path(manifest).read_bytes()).hexdigest() if manifest else None},
                   "mode": "fixed-cases",
+                  "manifest": str(manifest) if manifest else None,
+                  "behavior": check_behavior(cases, expectations) if expectations is not None else None,
                   "cases_dir": str(cases_dir), "labels_dir": str(labels_dir),
                   "protocol": PROTOCOL_ID,
                   "truth_basis": (f"外部人工标签（{labels_dir}）；"
@@ -470,7 +480,8 @@ def run_fixed_regression(cases_dir, labels_dir, *, out=None, analyzer=None,
         if not keep and not out:
             import shutil
             shutil.rmtree(workspace, ignore_errors=True)
-            report["report_path"] = None
+            if report is not None:
+                report["report_path"] = None
 
 
 def format_report(report: dict) -> str:
@@ -480,9 +491,10 @@ def format_report(report: dict) -> str:
     agreement = report.get("agreement") or {"matching": 0, "cases": 0,
                                             "agreement_rate": None, "mismatches": []}
     lines = [
-        "闭环回归报告（真值 = SD-WINDOW-1.1 参考实现从生成数据算出，裁判全自动）",
+        ("固定案例回归（外部标签；unknown 单独评价；不调用 AI）" if report.get("mode") == "fixed-cases"
+         else "闭环回归报告（真值 = SD-WINDOW-1.1 参考实现从生成数据算出，裁判全自动）"),
         "-" * 64,
-        f"场景 {totals['cases']} 条 · 导入 {report['import'].get('imported', 0)} 条成功 · "
+        f"场景 {metrics.get('input_cases', totals['cases'])} 条 · 导入 {report['import'].get('imported', 0)} 条成功 · "
         f"失败 {len(report['import_failures'])} 条",
         f"真值事件 {totals['truth_events']} 个 · 检出 {totals['detected_events']} 个 · "
         f"检出率 {_percent(totals['detection_rate'])}（宽筛层）",
@@ -499,6 +511,7 @@ def format_report(report: dict) -> str:
         f"口径实现一致 {agreement['matching']}/{agreement['cases']}"
         f"（{_percent(agreement['agreement_rate'])}）",
         "",
+        f"事件指标纳入 {totals['cases']} 条；无法判断标签排除 {metrics.get('excluded_uncertain_cases', 0)} 条",
         "分模板：",
     ]
     for profile, bucket in sorted(metrics["by_profile"].items()):
@@ -510,9 +523,11 @@ def format_report(report: dict) -> str:
             f"（误判 {bucket['misjudged_candidates']} / 噪声 {bucket['screening_noise_candidates']}）")
     boundary = metrics["boundary_cases"]
     if boundary["cases"]:
+        boundary_label = ("有场景备注的案例" if report.get("mode") == "fixed-cases"
+                          else "贴边界/对抗样本（生成器标注）")
         lines += [
             "",
-            f"贴边界/对抗样本（生成器标注）：{boundary['cases']} 条 · 检出率 "
+            f"{boundary_label}：{boundary['cases']} 条 · 检出率 "
             f"{_percent(_rate(boundary['detected_events'], boundary['truth_events']))} · "
             f"误报候选占比 {_percent(_rate(boundary['false_positive_candidates'], boundary['candidates']))} · "
             f"误报簇占比 {_percent(_rate(boundary['false_positive_clusters'], boundary['candidate_clusters']))} · "
@@ -568,7 +583,7 @@ def check_report(report: dict, gates: dict | None = None) -> dict:
     agreement = report.get("agreement") or {}
     noise = totals.get("false_positive_candidate_ratio")
     missed = totals["truth_events"] - totals["detected_events"]
-    # 确认层漏检：真值事件被候选覆盖、却没有被确认区间覆盖的数目。
+    # 确认层漏检：没有被数值确认区间覆盖的真值事件数（含候选漏检）。
     # 与“漏检事件”分开设门禁——候选覆盖正常但确认能力退化（区间收紧、
     # 匹配规则变严）时，漏检门禁全绿而确认率暗跌，必须单独拦。
     confirmed_missed = totals["truth_events"] - totals["confirmed_events"]
@@ -584,7 +599,7 @@ def check_report(report: dict, gates: dict | None = None) -> dict:
         gate("口径误判", totals["misjudged_candidates"] <= limits["max_misjudged"],
              totals["misjudged_candidates"], limits["max_misjudged"],
              f"自判符合口径却无真值支撑的候选 {totals['misjudged_candidates']} 个（实现 bug）"),
-        gate("实现一致", (agreement.get("agreement_rate") or 0.0) >= limits["min_agreement"],
+        gate("实现一致", (agreement.get("agreement_rate") or 0.0) >= limits["min_agreement"] or (agreement.get("cases") == 0 and bool(report["metrics"].get("quality_cases"))),
              agreement.get("agreement_rate"), limits["min_agreement"],
              f"参考实现与工具口径区间一致 {agreement.get('matching', 0)}/"
              f"{agreement.get('cases', 0)}"),
@@ -592,8 +607,8 @@ def check_report(report: dict, gates: dict | None = None) -> dict:
              f"漏检真值事件 {missed} 个"),
         gate("确认漏检", confirmed_missed <= limits["max_confirmed_missed"],
              confirmed_missed, limits["max_confirmed_missed"],
-             f"被候选覆盖但未被确认区间覆盖的真值事件 {confirmed_missed} 个"
-             f"（候选正常而确认能力退化时此项才暴露）"),
+             f"未被数值确认区间覆盖的真值事件 {confirmed_missed} 个"
+             f"（含候选漏检；用于检查数值确认层遗漏）"),
         gate("宽筛噪声", noise is None or noise <= limits["max_noise_candidates"],
              noise, limits["max_noise_candidates"],
              f"误报候选占比 {_percent(noise)}"),
@@ -601,6 +616,17 @@ def check_report(report: dict, gates: dict | None = None) -> dict:
              totals["structural_mismatch_cases"], limits["max_structural_mismatch"],
              f"候选簇数与真值事件数不一致的案例 {totals['structural_mismatch_cases']} 个"),
     ]
+    quality = report["metrics"].get("quality_cases", [])
+    if quality:
+        unexpected = sum(case["unexpected_numeric_confirmations"] for case in quality)
+        results.append(gate("未知案例确认", unexpected == 0, unexpected, 0,
+                            f"无法判断案例中出现 {unexpected} 个数值确认候选"))
+    behavior = report.get("behavior")
+    if behavior is not None:
+        failed = [item for item in behavior["checks"] if not item["ok"]]
+        detail = "; ".join(f"{item['case_id']}:{item['field']}" for item in failed)
+        results.append(gate("逐案例行为", not failed, len(failed), 0,
+                            f"{len(failed)} 项行为偏离预期" + (f"：{detail}" if detail else "")))
     return {"passed": all(item["ok"] for item in results), "gates": results,
             "limits": limits}
 
@@ -610,7 +636,7 @@ def format_gates(result: dict) -> str:
     for item in result["gates"]:
         mark = "PASS" if item["ok"] else "FAIL"
         lines.append(f"  [{mark}] {item['gate']}：{item['message']}"
-                     f"（上限 {item['limit']}）")
+                     f"（阈值 {item['limit']}）")
     lines.append("结论：" + ("全部通过" if result["passed"] else "存在未过项，退出码非零"))
     return "\n".join(lines)
 

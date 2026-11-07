@@ -190,6 +190,7 @@ class FixedCasesModeTest(unittest.TestCase):
         labels = Path(temporary) / "labels"
         labels.mkdir(parents=True, exist_ok=True)
         for name, payload in files.items():
+            (Path(temporary) / "cases" / name).mkdir(parents=True, exist_ok=True)
             (labels / f"{name}.json").write_text(json.dumps(payload, ensure_ascii=False),
                                                  encoding="utf-8")
         return labels
@@ -255,6 +256,22 @@ class FixedCasesModeTest(unittest.TestCase):
                            "--count", "10")
             self.assertEqual(proc.returncode, 2)
             self.assertIn("不能与 --count/--seed 混用", proc.stderr)
+
+
+class RegressReadinessTest(unittest.TestCase):
+    """regress 的环境容错：缺 analyzer 时给中文引导，不抛崩溃栈。"""
+
+    def test_invalid_analyzer_path_returns_guidance(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            invalid = Path(temporary) / "not-an-analyzer"
+            proc = run_cli("regress", "--count", "1", "--rows", "20", "--seed", "1",
+                           "--analyzer", str(invalid))
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("回归未开始", proc.stderr)
+        self.assertIn(str(invalid), proc.stderr)
+        self.assertIn("--analyzer", proc.stderr)
+        self.assertIn("CASE_ANALYZER_ROOT", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
 
 
 if __name__ == "__main__":

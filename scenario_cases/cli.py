@@ -193,6 +193,8 @@ def build_parser() -> argparse.ArgumentParser:
     regress.add_argument("--labels", type=Path, default=None,
                          help="固定案例模式：外部标签目录（<case_id>.json，events 字段）。"
                               "与 --cases 同时提供")
+    regress.add_argument("--manifest", type=Path, default=None,
+                         help="固定集成员与逐案例行为断言；默认读取 cases/labels 共同上级的 manifest.json")
     regress.add_argument("--out", type=Path, default=None,
                          help="工作目录（场景、runtime、报告）；默认临时目录，跑完即清")
     regress.add_argument("--keep", action="store_true", help="保留默认临时目录中的现场")
@@ -245,6 +247,9 @@ def _run_regress(args) -> int:
                                         run_fixed_regression, run_regression)
 
     fixed = bool(args.cases) or bool(args.labels)
+    if args.manifest and not fixed:
+        print("--manifest 需要 --cases 与 --labels", file=sys.stderr)
+        return 2
     if fixed:
         if not (args.cases and args.labels):
             print("--cases 与 --labels 必须同时提供", file=sys.stderr)
@@ -261,7 +266,7 @@ def _run_regress(args) -> int:
         if fixed:
             report = run_fixed_regression(args.cases, args.labels, out=args.out,
                                           analyzer=args.analyzer, keep=args.keep,
-                                          coverage_rule=args.coverage_rule)
+                                          coverage_rule=args.coverage_rule, manifest=args.manifest)
         else:
             report = run_regression(
                 count=args.count if args.count is not None else DEFAULT_COUNT,

@@ -48,10 +48,15 @@ def qualifying_windows(times: list[float], speeds: list[float]) -> list[dict]:
     3. 窗口内累计回升 ≤ 0.1 m/s。
     """
     windows = []
+    # 最后一个可用窗口从 len(speeds)-STEPS 开始：窗口需要 6 个采样点，
+    # 起点再往后就没有完整 0.5 秒可看。数据不足时 range 直接为空。
     for i in range(max(0, len(speeds) - STEPS)):
         values = speeds[i:i + STEPS + 1]
+        # 逐间隔差分：deltas[k] 是第 k 个 0.1 秒间隔的速度变化。
         deltas = [values[k + 1] - values[k] for k in range(STEPS)]
         drop = values[0] - values[-1]
+        # EPS 统一放在比较侧：浮点车速序列可能带 1e-15 级误差，
+        # 直接用 > / >= 会把数学上恰好贴门槛的样本判错方向。
         decreases = sum(1 for d in deltas if d <= -DECREASING_INTERVAL_MIN_DROP_MPS + EPS)
         recovery = sum(d for d in deltas if d > 0)
         if (drop >= MIN_SPEED_DROP_MPS - EPS
@@ -71,10 +76,15 @@ def merge_intervals(intervals, times: list[float],
     无缺失），因此这里不重复做来源校验。"""
     merged: list[list[float]] = []
     for start, end in sorted((float(a), float(b)) for a, b in intervals):
+        # 分支一：重叠或相接（start ≤ 上一簇右端）直接并入当前簇。
+        # 这里不检查间隔内速度——两段窗口已经各自合格，拼接本身就是合法合并。
         if merged and start <= merged[-1][1] + EPS:
             merged[-1][1] = max(merged[-1][1], end)
             continue
         if merged:
+            # 分支二：间隔 ≤ 0.5 秒时尝试“搭桥”。搭桥不看整段总降幅，
+            # 只看三点：间隔内每个采样都不回升（d ≤ 0）、跨间隔总降幅
+            # ≥ 0.01 m/s、且至少有两个采样点可检查。
             previous = merged[-1][1]
             if start - previous <= MAX_BRIDGE_GAP_SECONDS + EPS:
                 gap = [(t, s) for t, s in zip(times, speeds)
@@ -87,6 +97,7 @@ def merge_intervals(intervals, times: list[float],
                             and gap_speeds[0] - gap_speeds[-1] >= MIN_BRIDGE_DROP_MPS - EPS):
                         merged[-1][1] = max(merged[-1][1], end)
                         continue
+        # 分支三：既不相接也不满足搭桥，开启新簇。
         merged.append([start, end])
     return merged
 

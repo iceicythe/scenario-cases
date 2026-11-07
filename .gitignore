@@ -8,3 +8,4 @@ generated/
 .DS_Store
 .idea/
 .vscode/
+scenario_library.db

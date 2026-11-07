@@ -70,7 +70,7 @@ jobs:
       - name: 安装被评测工具依赖
         run: pip install -r case-analyzer-oss/requirements.txt
       # 对拍 suites/hard-cases-v1（采样缺口三例 + 人工标签）。阈值是
-      # 2026-10-21 基线固化下来的已知行为包线，不是通过线：实现一致 2/3
+      # 2026-10-21 基线固化下来的已知行为包线，不是通过线：实现一致 1/2（uncertain 单列）
       # 与结构不一致 1 来自 seg_023 人机分歧（工具按缺口拆区间、人工判定
       # 连续事件），确认漏检 2 与噪声 66.7% 是缺口案例不自动确认的设计行为。
       # 任何一项跌破包线即失败，由人评估是改进还是退化后再决定是否调阈值。
@@ -79,8 +79,9 @@ jobs:
         run: >
           python -m scenario_cases regress
           --cases suites/hard-cases-v1/cases --labels suites/hard-cases-v1/labels
+          --manifest suites/hard-cases-v1/manifest.json
           --out hard-cases-out --keep --check
-          --max-import-failures 0 --max-misjudged 0 --min-agreement 0.6
+          --max-import-failures 0 --max-misjudged 0 --min-agreement 0.5
           --max-missed 0 --max-confirmed-missed 2 --max-noise-candidates 0.7
           --max-structural-mismatch 1
       - name: 留存对拍报告

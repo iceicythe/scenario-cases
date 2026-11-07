@@ -161,15 +161,26 @@ python -m scenario_cases regress --count 20 --seed 20261019 --check --max-noise-
 # --out 必须是全新目录：runtime 已有同 ID 数据时导入判冲突（导入保护，不是回归）
 python -m scenario_cases regress \
     --cases suites/hard-cases-v1/cases --labels suites/hard-cases-v1/labels \
+    --manifest suites/hard-cases-v1/manifest.json \
     --out generated/hard-cases-run --keep --check \
-    --min-agreement 0.6 --max-confirmed-missed 2 --max-noise-candidates 0.7 \
+    --min-agreement 0.5 --max-confirmed-missed 2 --max-noise-candidates 0.7 \
     --max-structural-mismatch 1
 ```
 
-2026-10-21 基线七项全过：导入 3/3、口径误判 0、实现一致 2/3（seg_023 人机分歧是
-已知差异）、漏检 0、确认漏检 2（缺口案例不自动确认的设计行为）、宽筛噪声 66.7%
-（缺口案例候选无支撑的已知行为）、结构不一致 1（同上）。阈值含义与成员说明见
-`suites/hard-cases-v1/manifest.json`——那是**已知行为包线**，不是通过线。
+closed-loop-regress-2.2 的固定集包含 3 例：2 例纳入事件指标，1 例
+`uncertain` 单列质量检查。实现一致率为 1/2（seg_023 的连续事件与工具分段
+存在已知分歧），不再把未知标签当成正确负例计入分母。其余基线为导入 3/3、
+口径误判 0、漏检 0、数值确认漏检 2、宽筛噪声 66.7%、结构不一致 1。
+这里检查的是无 AI 的候选数值判定，不是冻结 AI 复核的事件精确率/召回率。
+
+`--check` 同时检查七项汇总门禁、未知案例不得数值确认、逐案例行为，合计九项。
+`manifest.json` 明确约束每例候选状态及数量、工具参考区间、是否允许数值确认；
+即使汇总数字变好，行为偏离也会失败，需复核后显式更新预期。
+案例目录、标签和 manifest 成员必须一一对应，缺少任何成员会在导入前报错。
+未指定 `--manifest` 时，自动读取 cases/labels 共同父目录的 `manifest.json`；
+没有清单的外部数据仅检查案例/标签配对和汇总指标，不宣称行为已被固化。
+全为 uncertain 时事件一致率为 n/a，跳过该比率门禁，由质量与行为门禁约束。
+省略 `--out/--keep` 仍可运行 `--check`，临时文件清理后只输出控制台结果。
 
 两种模式的报告带同样的元数据：`code_version`（两个仓库的 git HEAD）、
 `data_fingerprint`（输入内容哈希）、协议、阈值快照与逐项门禁结果——
@@ -220,8 +231,8 @@ case-analyzer 的有意设计：候选筛查门槛（0.6 m/s 降幅、3 个下�
 口径分叉的用例见 `tests/test_regress.py::test_false_positive_two_calibers_differ`。
 
 > 生成器 0.2.1 修复了模板配比的排序口径（见下），同一种子生成的场景序列随之变化，
-> 因此本数字与 0.2.0 时代的记录（误报 15.1%）不同。0.2.0 的两轮历史报告保留在
-> `generated/regress-w5/` 与 `generated/regress-w6/` 存档，不随代码改动回溯改写。
+> 因此本数字与 0.2.0 时代的记录（误报 15.1%）不同。旧数字属于当时的本地运行记录，
+> 不随仓库发布；如需复算，需在对应历史提交上重跑。
 
 `--out` 目录下留存 `regression_report.json`（逐案例明细：漏检事件、误报候选及判定、
 分模板统计、贴边界样本、实现不一致清单），默认临时目录跑完即清，`--keep` 可留现场排查。
@@ -230,7 +241,7 @@ case-analyzer 的有意设计：候选筛查门槛（0.6 m/s 降幅、3 个下�
 
 - 100% 检出率是**可证明的**（宽筛门槛严格更松，协议事件必被候选覆盖），不是巧合；
   本轮的价值在于两个独立实现在 60 条对抗样本上逐条一致。
-- 宽筛噪声 15.1% 量化了"宽筛→复核"这条设计的固有成本，**不代表工具在真实数据上会误报**——
+- 宽筛噪声 19.6% 量化了"宽筛→复核"这条设计的固有成本，**不代表工具在真实数据上会误报**——
   真实数据的噪声结构（传感器误差、采样抖动、合法驾驶行为）不在生成能力内。
 - 参考实现是照抄口径常量的第二份实现，不是第三方标准实现；它和工具一致，证明的是
   "双方对口径的理解一致"，不是"口径本身正确"。
@@ -302,9 +313,10 @@ python -B -m unittest discover -s tests -v
 
 ## Roadmap
 
-已实现：场景生成器、场景库、回归集、闭环回归、口径参考实现与对抗样本。
+已实现：场景生成器、场景库、回归集、闭环回归、口径参考实现与对抗样本，
+以及 GitHub Actions CI 流水线（单元测试 + 固定种子闭环回归门禁 + 困难案例对拍）。
 
-可能的方向（不承诺排期）：更多对抗形状、适配其他分析工具、CI 流水线。
+可能的方向（不承诺排期）：更多对抗形状、适配其他分析工具。
 欢迎通过 Issue / PR 交流。
 
 **非目标**：物理引擎、传感器建模、3D 渲染、CARLA/SUMO 集成、强化学习——

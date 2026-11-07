@@ -89,27 +89,44 @@ def resolve_params(profile: str, params: dict | None = None) -> dict:
 
 
 def _jitter_speed(t: float, params: dict) -> tuple[float, float]:
-    """三角抖动：at 之前匀速，之后以 period 为周期在 v0 与 v0-amp 间波动。"""
+    """三角抖动：at 之前匀速，之后以 period 为周期在 v0 与 v0-amp 间波动。
+
+    输出 (speed, acceleration)：加速度取三角波两条斜边的解析斜率，
+    供生成器写入 acceleration_mps2；边界点上左右斜率不同，这里按所在
+    分支的斜率返回，采样点不会停在理论边界之外。
+    """
     v0, amp, period, at = params["v0"], params["amp"], params["period"], params["at"]
     if t < at:
+        # 抖动开始前保持巡航：速度 v0、加速度 0。
         return v0, 0.0
+    # phase ∈ [0, period)：把任意 t 折回一个周期内再分上/下斜边。
     phase = (t - at) % period
     half = period / 2.0
     if phase <= half:
+        # 下斜边：v0 线性降到 v0-amp，斜率恒为 -amp/half。
         return v0 - amp * (phase / half), -amp / half
+    # 上斜边：从底部线性回 v0。2.0-phase/half 在 (0,1] 之间。
     return v0 - amp * (2.0 - phase / half), amp / half
 
 
 def _dip_speed(t: float, params: dict) -> tuple[float, float]:
-    """V 形：急减 dip 秒后以同样速率恢复——考察「急减但不够持续」的口径边界。"""
+    """V 形：急减 dip 秒后以同样速率恢复——考察「急减但不够持续」的口径边界。
+
+    边界处理：三段用半开区间 [at, at+dip)、[at+dip, at+dip+recover)、
+    之后保持 v0——恰好落在切换点时进入下一段，保证任意时刻只属于一段。
+    """
     v0, at, dip = params["v0"], params["at"], params["dip"]
     decel, recover = params["decel"], params["recover"]
     if t < at:
+        # 减速前巡航。
         return v0, 0.0
     if t < at + dip:
+        # 急减段：速度线性下降，斜率 -decel。
         return v0 - decel * (t - at), -decel
     if t < at + dip + recover:
+        # 恢复段：从谷底按同一减速度大小回升到 v0。
         return v0 - decel * dip + decel * (t - at - dip), decel
+    # 恢复完成后回到巡航速度。
     return v0, 0.0
 
 
@@ -135,12 +152,21 @@ def _double_dip_speed(t: float, params: dict) -> tuple[float, float]:
 
 
 def speed_at(profile: str, t: float, params: dict) -> tuple[float, float]:
-    """返回 t 时刻的 (speed, acceleration)。"""
+    """返回 t 时刻的 (speed, acceleration)。
+
+    分派规则按“曲线形状”而不是典型/对抗分组：需要复合形状的模板
+    各自有专用函数；其余共享“单一持续减速窗 + 窗外保持末端速度”的
+    通用分支（典型组与 sub_threshold）。所有分支的切换点都用半开区间，
+    同一时刻只会命中一段。
+    """
     if profile == "cruise":
+        # 全程匀速：速度 v0、加速度 0。
         return params["v0"], 0.0
     if profile == "jitter":
         return _jitter_speed(t, params)
     if profile in ("short_dip", "v_dip"):
+        # 两类 dip 共用 V 形实现；差别在 dip 范围（≤0.34 / ≥0.4），
+        # 由 PROFILE_RANGES 保证各自落在“无事件 / 有事件”一侧。
         return _dip_speed(t, params)
     if profile == "double_dip":
         return _double_dip_speed(t, params)
